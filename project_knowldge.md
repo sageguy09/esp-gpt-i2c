@@ -9,6 +9,9 @@ This project integrates the ESP32 with the ArtNet protocol, I2SClockless LED dri
 - **I2SClockless LED Driver**: Controls WS2812B LEDs using the I2S interface for smooth performance.
 - **Web UI Configuration**: A simple web interface for setting up the Wi-Fi SSID, password, and LED configurations.
 - **OLED Display Debug**: A small OLED display for real-time status updates, such as the current IP address and LED configuration.
+- **Static Color Mode**: Apply a single color to all LEDs without requiring ArtNet data.
+- **Color Cycle Effects**: Three built-in color effects (Rainbow, Pulse, Fire) with adjustable speed.
+- **Individual Pin Configuration**: Configure each of the 4 output pins separately through the web UI.
 
 ### Dependencies:
 - **WiFi.h**: Wi-Fi connectivity for the ESP32.
@@ -46,16 +49,35 @@ The web UI allows you to configure the following settings:
 - **LEDs per Strip**: Number of LEDs on each strip (e.g., 144).
 - **Number of Strips**: The number of strips connected (e.g., 3).
 - **Brightness**: Set the maximum brightness for the LEDs (0-255).
+- **Pin Configuration**: Set GPIO pins for each of the 4 outputs (default: 12, 14, 2, 4).
 - **SSID and Password**: Connect to Wi-Fi by entering your SSID and password.
 - **Web Interface URL**: Once the ESP32 is connected to Wi-Fi, open the ESP32's IP address in a browser to access the configuration page.
 
-### 2. ArtNet Data Reception:
+### 2. Operation Modes:
+The controller supports three mutually exclusive operating modes:
+- **ArtNet Mode**: Receive and display color data sent over the network using the ArtNet protocol.
+- **Static Color Mode**: Display a single, user-selected color on all LEDs.
+- **Color Cycle Mode**: Run one of three built-in color effects (Rainbow, Pulse, Fire) at an adjustable speed.
+
+### 3. ArtNet Data Reception:
 - The ESP32 listens for ArtNet data over the network (default port 6454).
 - When data is received, it is processed in the callback function (artnetCallback) which updates the LEDs using the I2SClocklessLedDriver.
 
-### 3. OLED Debug Display:
+### 4. Static Color:
+- Allows setting a fixed color for all LEDs without needing ArtNet data.
+- Color is selected using a color picker in the web UI.
+- Settings are saved to non-volatile memory and persist across reboots.
+
+### 5. Color Cycle Effects:
+- **Rainbow**: Smooth color transitions across all LEDs.
+- **Pulse**: A pulsing effect with changing colors.
+- **Fire**: A realistic fire simulation with random flickering.
+- Speed is adjustable through the web UI.
+
+### 6. OLED Debug Display:
 - Displays the current status of the ESP32, including the connected IP address and other relevant debug information such as the number of LEDs, strips, and current settings.
-- Updates in real-time as ArtNet data is received.
+- Shows the current operation mode (ArtNet, Static Color, or Color Cycle).
+- Updates in real-time as settings change.
 
 ## Code Explanation
 
@@ -63,10 +85,22 @@ The web UI allows you to configure the following settings:
 - **NUM_LEDS_PER_STRIP**: Defines the number of LEDs on each strip. **IMPORTANT: Must be defined before including I2SClocklessLedDriver.h**.
 - **NUMSTRIPS**: Defines the total number of strips (maximum of 12, with 3 strips per pin).
 - **ledData**: Holds the LED data that is sent to the I2SClocklessLedDriver.
-- **sendFrame**: Flag to indicate when a frame should be sent to the LEDs.
-- **settings**: Stores the configuration settings like Wi-Fi SSID, password, and LED configurations.
+- **settings**: Stores the configuration settings like Wi-Fi SSID, password, LED configurations, and mode preferences.
+- **cyclePosition**: Tracks the position in animation cycles for color effects.
+
+### Operation Modes:
+- **useArtnet**: When enabled, the controller listens for ArtNet data and displays it on the LEDs.
+- **useStaticColor**: When enabled, all LEDs display the same, user-selected color.
+- **useColorCycle**: When enabled, the controller runs one of the built-in color cycle effects.
+
+These modes are mutually exclusive - enabling one will automatically disable the others.
 
 ### Main Components:
+
+#### Pin Configuration:
+- The controller supports up to 4 output pins that can each drive multiple LED strips.
+- Pins are configured through the web UI with individual settings for each pin.
+- Default pin configuration: 12, 14, 2, 4.
 
 #### ArtNet Setup:
 - The ArtNet server is set up with `artnet.listen(localIP, 6454)` to listen for incoming ArtNet packets.
@@ -76,18 +110,19 @@ The web UI allows you to configure the following settings:
 
 #### LED Control:
 - The LEDs are controlled using the I2SClocklessLedDriver library. The data is passed to the driver with `driver.showPixels()`.
+- In static color mode, all LEDs are set to the same color value.
+- In color cycle mode, LEDs are updated according to the selected effect pattern.
 
 #### Web Server:
 - The web server is set up to listen on port 80 and serve the configuration page.
-- The configuration data is read from the web UI and saved to memory (no SPIFFS is involved).
+- The page dynamically shows/hides controls based on the selected operation mode.
+- All settings are saved to non-volatile memory using the Preferences library.
 
 #### OLED Debug:
 - An OLED display is used to show the current IP address and other status information.
-- It also displays a status of the LED configuration and updates in real-time.
+- It also displays the current operation mode and updates in real-time.
 
 ## Code Overview
-
-Here's a breakdown of the important code sections:
 
 ### 1. Setting Up ArtNet:
 ```cpp
@@ -95,41 +130,78 @@ IPAddress localIP = WiFi.localIP();
 artnet.listen(localIP, 6454);  // Start listening for ArtNet data
 artnet.setFrameCallback(frameCallbackWrapper);  // Set the callback to handle ArtNet frames
 ```
-- `artnet.listen()`: Starts listening for ArtNet packets.
-- `artnet.setFrameCallback()`: Sets a wrapper callback function that complies with the required function signature.
 
-### 2. ArtNet Callbacks:
+### 2. Static Color Implementation:
 ```cpp
-// Wrapper function for the frame callback (required by artnetESP32V2)
-void frameCallbackWrapper() {
-  // Empty function - actual processing happens in the subArtnet callback
+// Apply static color to all LEDs
+void applyStaticColor() {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i] = settings.staticColor;
+  }
+}
+```
+
+### 3. Color Cycle Effects:
+```cpp
+// Rainbow pattern
+void rainbowCycle() {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    int pixelHue = (i * 256 / settings.ledsPerStrip) + cyclePosition;
+    pixelHue = pixelHue % 256;
+    ledData[i] = hsvToRgb(pixelHue, 240, settings.brightness);
+  }
+  cyclePosition = (cyclePosition + 1) % 256;
 }
 
-// Actual data processing function (called by subArtnet)
-void artnetCallback(void* param) {
-  subArtnet* sub = (subArtnet*)param;
-  uint8_t* data = sub->getData();
-  int dataLength = sub->_nb_data;
+// Pulse effect
+void pulseEffect() {
+  float intensity = (sin(cyclePosition * 0.0245) + 1.0) / 2.0;
+  uint8_t value = intensity * settings.brightness;
+  rgb24 color = hsvToRgb(cyclePosition, 255, value);
   
-  // Process data and update LEDs...
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i] = color;
+  }
+  cyclePosition = (cyclePosition + 1) % 256;
+}
+
+// Fire effect
+void fireEffect() {
+  // Complex fire simulation algorithm
+  // Creates realistic flickering flames
 }
 ```
 
-### 3. Web UI Configuration:
+### 4. LED Update Logic:
 ```cpp
-void handleRoot() {
-  String html = "<html><head><title>ESP32 Artnet</title></head><body><h2>ESP32 Artnet I2SClockless</h2>";
-  html += "<form method='POST' action='/config'>";
-  html += "<label>LEDs/Strip:</label><input name='leds' value='" + String(settings.ledsPerStrip) + "'><br>";
-  html += "<label>Strips:</label><input name='strips' value='" + String(settings.numStrips) + "'><br>";
-  html += "<label>Brightness:</label><input name='bright' value='" + String(settings.brightness) + "'><br>";
-  html += "<label>SSID:</label><input name='ssid' value='" + settings.ssid + "'><br>";
-  html += "<label>Password:</label><input name='pass' value='" + settings.password + "'><br>";
-  html += "<input type='submit'></form></body></html>";
-  server.send(200, "text/html", html);
+void updateLEDsBasedOnMode() {
+  // Only update at appropriate intervals based on cycle speed
+  
+  if (settings.useArtnet) {
+    // ArtNet mode - data handled by callback
+    return;
+  }
+
+  if (settings.useStaticColor) {
+    // Static color mode
+    applyStaticColor();
+  } else if (settings.useColorCycle) {
+    // Color cycle mode
+    switch (settings.colorMode) {
+      case COLOR_MODE_RAINBOW: rainbowCycle(); break;
+      case COLOR_MODE_PULSE: pulseEffect(); break;
+      case COLOR_MODE_FIRE: fireEffect(); break;
+      default: rainbowCycle(); break;
+    }
+  } else {
+    // Fallback to static color
+    applyStaticColor();
+  }
+  
+  // Update LEDs with new data
+  driver.showPixels(NO_WAIT);
 }
 ```
-- `handleRoot()`: Generates an HTML form for the user to input their configuration.
 
 ## Known Issues and Fixes
 
@@ -147,18 +219,24 @@ void handleRoot() {
 - Use `sub->getData()` to get the ArtNet data buffer instead of trying to access a non-existent `lengthData` property.
 - Use `sub->_nb_data` to get the data length.
 
-### Multiple Libraries for SSD1306:
-- If you encounter multiple versions of the Adafruit_SSD1306 library, ensure you only have one version installed. Remove any redundant libraries in the Arduino IDE.
+### Color Effects Timing:
+- Color cycle effects use `millis()` for timing to ensure smooth, non-blocking animation.
+- The animation speed is controlled by the `cycleSpeed` setting in the web UI.
 
-## Further Improvements
+### Type Casting for Math Functions:
+- When using `max()` and `min()` functions with different types (like `int` and `long int`), explicit casting is required to avoid compilation errors.
+- Example: `heat[i] = max(0, (int)heat[i] - (int)random(0, cooling));`
+
+## Future Improvements
 
 - **Add Support for More LED Types**: Extend the code to handle additional types of LEDs, such as WS2811 or APA102.
-- **Enhanced Web UI**: Improve the UI with more options like custom color controls or effects for the LEDs.
-- **Error Handling**: Add error handling for cases where the ESP32 fails to connect to Wi-Fi or ArtNet communication is interrupted.
-- **Use SPIFFS or Preferences for persistent storage**: Currently settings are only stored in memory and lost on reboot.
+- **Enhanced Color Effects**: Add more complex patterns and effects to the color cycle options.
+- **DMX Control**: Add support for direct DMX control over Ethernet or USB.
+- **Scheduled Effects**: Allow setting up schedules for different effects to run at specific times.
+- **Audio Reactive Effects**: Add support for audio input to create sound-reactive LED patterns.
 
 ## Final Notes
 
-This project provides a robust way to control WS2812B LEDs via ArtNet, using an ESP32. The combination of I2SClockless LED control, ArtNet communication, and the Web UI configuration makes it flexible and easy to use for various interactive lighting setups.
+This project provides a robust way to control WS2812B LEDs via ArtNet, static color, or built-in effects, using an ESP32. The combination of I2SClockless LED control, ArtNet communication, and the web UI configuration makes it flexible and easy to use for various interactive lighting setups.
 
-The artnetESP32V2 library has a specific callback structure that needs to be properly implemented for the ArtNet data to flow correctly. Make sure to follow the pattern described in this document when making changes to the code.
+Settings are stored in non-volatile memory, so your configuration persists across power cycles. The mode selection (ArtNet, Static Color, or Color Cycle) allows for versatile usage scenarios from professional light installations to simple mood lighting.
