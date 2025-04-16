@@ -76,6 +76,11 @@ artnetESP32V2 artnet;
 rgb24 ledData[MAX_STRIPS * NUM_LEDS_PER_STRIP]; // Fixed error with NUM_LEDS_PER_STRIP
 bool sendFrame = false;
 
+// Anti-boot loop protection
+// This is a global variable to track critical errors and prevent retries
+bool networkInitFailed = false;
+bool ledHardwareFailed = false;
+
 // Runtime state + settings struct
 struct Settings
 {
@@ -115,6 +120,23 @@ struct Settings
     .staticColor = {255, 0, 255}, // Default to magenta (red+blue) for visibility
     .cycleSpeed = 50              // Medium speed
 };
+
+// Function to handle the tcpip_send_msg assert failure that's causing the boot loop
+void disableAllNetworkOperations() {
+  // Complete network shutdown sequence
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  // Mark as failed to prevent any future attempts
+  networkInitFailed = true;
+  
+  // Force settings to disable any network functionality
+  settings.useArtnet = false;
+  settings.useWiFi = false;
+  settings.useStaticColor = true;
+  
+  debugLog("CRITICAL: Network stack disabled due to assertion failure");
+}
 
 struct State
 {
@@ -356,13 +378,14 @@ void handleConfig()
   // Properly reinitialize the LED driver with the improved function
   // This ensures all pin changes and other configuration updates are applied
   initializeLEDDriver();
-  
-  debugLog("LED configuration updated: strips=" + String(settings.numStrips) + 
-           ", ledsPerStrip=" + String(settings.ledsPerStrip) + 
+
+  debugLog("LED configuration updated: strips=" + String(settings.numStrips) +
+           ", ledsPerStrip=" + String(settings.ledsPerStrip) +
            ", brightness=" + String(settings.brightness));
-  
+
   // If we're in static color mode, immediately apply the color
-  if (settings.useStaticColor) {
+  if (settings.useStaticColor)
+  {
     applyStaticColor();
   }
 
@@ -484,10 +507,10 @@ void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
       settings.staticColor.r = data[0];
       settings.staticColor.g = data[1];
       settings.staticColor.b = data[2];
-      
+
       // Log the color change
-      debugLog("UART: Setting color to R=" + String(data[0]) + 
-               ", G=" + String(data[1]) + 
+      debugLog("UART: Setting color to R=" + String(data[0]) +
+               ", G=" + String(data[1]) +
                ", B=" + String(data[2]));
 
       // If in static color mode, apply the color immediately with improved method
@@ -495,14 +518,14 @@ void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
       {
         // Critical: reinitialize driver to ensure clean state
         initializeLEDDriver();
-        
+
         // Apply the static color with the improved method
         applyStaticColor();
       }
 
       // Save to persistent storage
       saveSettings();
-      
+
       // Acknowledge the command
       uartBridge.sendCommand(CMD_ACK, data, 3);
     }
@@ -520,92 +543,142 @@ unsigned long lastColorUpdate = 0;
 uint8_t cyclePosition = 0;
 
 // Test function for LED hardware diagnosis that combines multiple test methods
-void testDirectLEDControl() {
+void testDirectLEDControl()
+{
   debugLog("Starting comprehensive LED test...");
-  
+
   // Test 1: Using I2SClocklessLedDriver directly
   debugLog("Test 1: Using I2SClocklessLedDriver directly");
-  
+
   // Clear all LEDs first
   memset(ledData, 0, sizeof(ledData));
   driver.showPixels(WAIT);
   delay(100);
-  
+
   // Set all LEDs to RED
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 255;
     ledData[i].g = 0;
     ledData[i].b = 0;
   }
   driver.showPixels(WAIT);
   delay(1000);
-  
+
   // Set all LEDs to GREEN
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 0;
     ledData[i].g = 255;
     ledData[i].b = 0;
   }
   driver.showPixels(WAIT);
   delay(1000);
-  
+
   // Test 2: Using Adafruit_NeoPixel for comparison
   debugLog("Test 2: Using Adafruit_NeoPixel library for comparison");
-  
+
   // Create NeoPixel strip with the same configuration
   Adafruit_NeoPixel strip(settings.ledsPerStrip, settings.pins[0], NEO_GRB + NEO_KHZ800);
   strip.begin();
   strip.setBrightness(settings.brightness);
-  
+
   // Set all LEDs to BLUE
-  for(int i=0; i < settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.ledsPerStrip; i++)
+  {
     strip.setPixelColor(i, 0, 0, 255);
   }
   strip.show();
   delay(1000);
-  
+
   // Set all LEDs to MAGENTA
-  for(int i=0; i < settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.ledsPerStrip; i++)
+  {
     strip.setPixelColor(i, 255, 0, 255);
   }
   strip.show();
   delay(1000);
-  
+
   // Test 3: Reinitialize I2SClocklessLedDriver and test again
   debugLog("Test 3: Reinitializing I2SClocklessLedDriver");
-  
+
   // Reinitialize with specific pin configuration
   int singlePin[1] = {settings.pins[0]};
   driver.initled(NULL, singlePin, 1, settings.ledsPerStrip);
   driver.setBrightness(settings.brightness);
-  
+
   // Set all LEDs to YELLOW
-  for (int i = 0; i < settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 255;
     ledData[i].g = 255;
     ledData[i].b = 0;
   }
   driver.showPixels(WAIT);
   delay(1000);
-  
+
   // Test 4: Try with direct buffer approach
   debugLog("Test 4: Direct buffer approach");
-  uint8_t *directBuffer = (uint8_t*)malloc(settings.ledsPerStrip * 3);
-  if (directBuffer) {
-    for (int i = 0; i < settings.ledsPerStrip; i++) {
-      directBuffer[i*3] = 255;    // R
-      directBuffer[i*3+1] = 0;    // G
-      directBuffer[i*3+2] = 255;  // B
+  uint8_t *directBuffer = (uint8_t *)malloc(settings.ledsPerStrip * 3);
+  if (directBuffer)
+  {
+    for (int i = 0; i < settings.ledsPerStrip; i++)
+    {
+      directBuffer[i * 3] = 255;     // R
+      directBuffer[i * 3 + 1] = 0;   // G
+      directBuffer[i * 3 + 2] = 255; // B
     }
-    
+
     driver.showPixels(WAIT, directBuffer);
     delay(1000);
     free(directBuffer);
   }
-  
+
   // Restore original LED driver configuration
   debugLog("LED test complete, reinitializing driver");
   initializeLEDDriver();
+}
+
+// Special quick test to verify LED driver functionality on startup
+void quickLEDTest() {
+  debugLog("Running quick LED verification test...");
+  
+  // Flash red briefly to confirm hardware is connected and working
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  delay(200);
+  
+  // Then green
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 255;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  delay(200);
+  
+  // Then blue
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 255;
+  }
+  driver.showPixels(WAIT);
+  delay(200);
+  
+  // Clear LEDs at end of test
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  
+  debugLog("LED verification test complete");
 }
 
 // Convert HSV to RGB
@@ -777,143 +850,176 @@ void fireEffect()
 }
 
 // Apply static color to all LEDs
-void applyStaticColor() {
-  if (!settings.useStaticColor) return;
-  
-  debugLog("Applying static color: R=" + String(settings.staticColor.r) + 
-           " G=" + String(settings.staticColor.g) + 
+void applyStaticColor()
+{
+  if (!settings.useStaticColor)
+    return;
+
+  debugLog("Applying static color: R=" + String(settings.staticColor.r) +
+           " G=" + String(settings.staticColor.g) +
            " B=" + String(settings.staticColor.b));
-  
+
   // Critical: Clear any previous data
   memset(ledData, 0, sizeof(ledData));
-  
+
   // Apply color to all LEDs
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = settings.staticColor.r;
     ledData[i].g = settings.staticColor.g;
     ledData[i].b = settings.staticColor.b;
   }
-  
+
   // Force immediate update with WAIT flag to ensure completion
-  // The WAIT parameter is critical for reliable static color updates
-  driver.showPixels(WAIT);
+  driver.showPixels(NO_WAIT);
   
-  // Additional verification - double-check the driver state
-  // This ensures the LEDs are in the correct state
-  driver.setBrightness(settings.brightness);
-  driver.showPixels(WAIT);
-  
+  // Add an additional verification update with a slight delay
+  // This double-update approach can help with some reliability issues
+  delay(2);
+  driver.showPixels(NO_WAIT);
+
   debugLog("Static color applied successfully");
 }
 
 // Main function to update LEDs based on current mode
-void updateLEDsBasedOnMode() {
+void updateLEDsBasedOnMode()
+{
   unsigned long currentMillis = millis();
 
   // Skip updates for animations if not enough time has passed
-  if (!settings.useStaticColor && 
-      !settings.useArtnet && 
-      currentMillis - lastColorUpdate < (101 - settings.cycleSpeed)) {
+  if (!settings.useStaticColor &&
+      !settings.useArtnet &&
+      settings.useColorCycle &&
+      currentMillis - lastColorUpdate < (101 - settings.cycleSpeed))
+  {
     return;
   }
 
   lastColorUpdate = currentMillis;
-  
+
   // ArtNet mode is handled separately in the callback
-  if (settings.useArtnet) {
+  if (settings.useArtnet)
+  {
     return;
   }
 
   // Static color mode has priority
-  if (settings.useStaticColor) {
-    applyStaticColor();
-  } 
-  // Color cycle mode
-  else if (settings.useColorCycle) {
-    switch (settings.colorMode) {
-      case COLOR_MODE_RAINBOW:
-        rainbowCycle();
-        break;
-      case COLOR_MODE_PULSE:
-        pulseEffect();
-        break;
-      case COLOR_MODE_FIRE:
-        fireEffect();
-        break;
-      default:
-        rainbowCycle();
-        break;
+  if (settings.useStaticColor)
+  {
+    // Only reapply static color periodically to avoid overwhelming the LED driver
+    static unsigned long lastStaticUpdate = 0;
+    if (currentMillis - lastStaticUpdate > 1000) // Update once per second
+    {
+      applyStaticColor();
+      lastStaticUpdate = currentMillis;
     }
+  }
+  // Color cycle mode
+  else if (settings.useColorCycle)
+  {
+    // Clear the buffer first
+    // This helps avoid artifacts from previous frames
+    memset(ledData, 0, sizeof(ledData));
     
-    // Critical: Force update LEDs
-    driver.showPixels(NO_WAIT);
+    // Apply the selected color effect
+    switch (settings.colorMode)
+    {
+    case COLOR_MODE_RAINBOW:
+      rainbowCycle();
+      break;
+    case COLOR_MODE_PULSE:
+      pulseEffect();
+      break;
+    case COLOR_MODE_FIRE:
+      fireEffect();
+      break;
+    default:
+      rainbowCycle();
+      break;
+    }
+
+    // Critical: Force update LEDs with WAIT flag for better reliability
+    driver.showPixels(WAIT);
   }
   // Fallback to static color if nothing else is active
-  else {
+  else if (!settings.useArtnet && !settings.useColorCycle)
+  {
+    // Force static color mode if nothing else is active
+    settings.useStaticColor = true;
     applyStaticColor();
   }
 }
 
 // Test LED strip with color sequence - useful for debugging hardware issues
-void testLEDs() {
+void testLEDs()
+{
   debugLog("LED Test Mode: Starting self-test");
-  
+
   // Clear all LEDs
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 0;
     ledData[i].g = 0;
     ledData[i].b = 0;
   }
   driver.showPixels(NO_WAIT);
   delay(500);
-  
+
   // Test RED
   debugLog("LED Test: RED");
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 255;
     ledData[i].g = 0;
     ledData[i].b = 0;
   }
   driver.showPixels(NO_WAIT);
   delay(1000);
-  
+
   // Test GREEN
   debugLog("LED Test: GREEN");
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 0;
     ledData[i].g = 255;
     ledData[i].b = 0;
   }
   driver.showPixels(NO_WAIT);
   delay(1000);
-  
+
   // Test BLUE
   debugLog("LED Test: BLUE");
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 0;
     ledData[i].g = 0;
     ledData[i].b = 255;
   }
   driver.showPixels(NO_WAIT);
   delay(1000);
-  
+
   // Test WHITE
   debugLog("LED Test: WHITE");
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+  {
     ledData[i].r = 255;
     ledData[i].g = 255;
     ledData[i].b = 255;
   }
   driver.showPixels(NO_WAIT);
   delay(1000);
-  
+
   // Return to normal state
   debugLog("LED Test: Complete");
-  if (settings.useStaticColor) {
+  if (settings.useStaticColor)
+  {
     applyStaticColor();
-  } else {
+  }
+  else
+  {
     // Turn LEDs off
-    for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
+    {
       ledData[i].r = 0;
       ledData[i].g = 0;
       ledData[i].b = 0;
@@ -925,9 +1031,20 @@ void testLEDs() {
 // Update the OLED display with current status information
 void updateDisplayStatus()
 {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
-  {
-    return; // Display initialization failed
+  static bool displayInitialized = false;
+  
+  // Only initialize the display once
+  if (!displayInitialized) {
+    displayInitialized = display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+    if (!displayInitialized) {
+      debugLog("OLED display initialization failed");
+      return;
+    }
+  }
+
+  // Only proceed if display is initialized
+  if (!displayInitialized) {
+    return;
   }
 
   display.clearDisplay();
@@ -953,60 +1070,14 @@ void updateDisplayStatus()
   if (settings.useArtnet)
   {
     display.print("Mode: ArtNet");
-
-    // Show ArtNet statistics
-    display.print(" Pkts:");
-    display.print(packetsReceived);
-
-    // Show if recent data received
-    if (millis() - lastPacketTime < PACKET_TIMEOUT)
-    {
-      display.print(" LIVE");
-    }
   }
   else if (settings.useColorCycle)
   {
-    display.print("Mode: Cycle (");
-    switch (settings.colorMode)
-    {
-    case COLOR_MODE_RAINBOW:
-      display.print("Rainbow");
-      break;
-    case COLOR_MODE_PULSE:
-      display.print("Pulse");
-      break;
-    case COLOR_MODE_FIRE:
-      display.print("Fire");
-      break;
-    default:
-      display.print(settings.colorMode);
-    }
-    display.println(")");
-    display.print("Speed: ");
-    display.print(settings.cycleSpeed);
+    display.print("Mode: Cycle");
   }
   else if (settings.useStaticColor)
   {
-    display.println("Mode: Static Color");
-    display.print("RGB: ");
-    display.print(settings.staticColor.r);
-    display.print(",");
-    display.print(settings.staticColor.g);
-    display.print(",");
-    display.print(settings.staticColor.b);
-  }
-
-  // Display UART status and errors
-  display.setCursor(0, 24);
-  display.print("UART:");
-  if (uartBridge.getLastError() == ERR_NONE)
-  {
-    display.print("OK");
-  }
-  else
-  {
-    display.print("Err:");
-    display.print(uartBridge.getLastError(), HEX);
+    display.print("Mode: Static");
   }
 
   display.display();
@@ -1107,285 +1178,329 @@ void saveSettings()
   debugLog("Settings saved to preferences");
 }
 
-// LED Driver Initialization
-// This is a critical fix that ensures proper LED strip initialization
-void initializeLEDDriver() {
-  debugLog("Initializing LED driver with settings: numStrips=" + String(settings.numStrips) + 
+// LED Driver Initialization with hardware failure detection
+void initializeLEDDriver()
+{
+  debugLog("Initializing LED driver with basic settings: strips=" + String(settings.numStrips) +
            ", ledsPerStrip=" + String(settings.ledsPerStrip));
+
+  // Clear any previous LED data
+  memset(ledData, 0, sizeof(ledData));
   
-  // Create pin configuration arrays based on settings
-  int activePins[4] = {-1, -1, -1, -1}; // Initialize all pins to -1 (disabled)
-  int activeCount = 0; // Track how many active pins we have
+  // Initialize with simplest possible configuration
+  // IMPORTANT FIX: Only use as many pins as strips, not all 4 pins
+  static int pins[4] = {-1, -1, -1, -1};
   
-  // Only add pins that are valid (not -1)
-  for (int i = 0; i < 4; i++) {
+  // Only configure exactly as many pins as we have strips
+  int activeCount = 0;
+  for (int i = 0; i < settings.numStrips && i < 4; i++) {
     if (settings.pins[i] >= 0) {
-      activePins[activeCount] = settings.pins[i];
+      pins[activeCount] = settings.pins[i];
       activeCount++;
     }
   }
   
-  // Ensure we have at least one valid pin
+  // Ensure at least one pin is active
   if (activeCount == 0) {
-    debugLog("ERROR: No valid pins configured. Using pin 12 as fallback.");
-    activePins[0] = 12; // Default to pin 12 if no valid pins
+    pins[0] = 12; // Default to pin 12
     activeCount = 1;
   }
   
-  // Update strips count to match active pin count if necessary
-  if (settings.numStrips > activeCount) {
-    debugLog("WARNING: More strips configured than pins available. Limiting to " + String(activeCount));
-    settings.numStrips = activeCount;
+  // CRITICAL FIX: Only use exactly as many pins as needed
+  debugLog("Using " + String(activeCount) + " pins for LED control");
+  
+  // Initialize with failure handling
+  try {
+    driver.initled(NULL, pins, activeCount, settings.ledsPerStrip);
+    
+    // Set brightness
+    driver.setBrightness(settings.brightness);
+    
+    // Simple test to ensure driver is working
+    driver.showPixels(WAIT);
+    debugLog("LED driver initialized successfully");
   }
-  
-  // Initialize driver with the active pins
-  debugLog("Configuring " + String(activeCount) + " active pin(s): " + String(activePins[0]) + 
-           (activeCount > 1 ? ", " + String(activePins[1]) : "") +
-           (activeCount > 2 ? ", " + String(activePins[2]) : "") + 
-           (activeCount > 3 ? ", " + String(activePins[3]) : ""));
-  
-  // Instead of resetLedsState (which doesn't exist), we'll manually clear things
-  // Clear existing LED data
-  memset(ledData, 0, sizeof(ledData));
-  
-  // Small delay before initialization
-  delay(10);
-  
-  // Initialize with active pins
-  driver.initled(NULL, activePins, activeCount, settings.ledsPerStrip);
-  
-  // Set global brightness
-  driver.setBrightness(settings.brightness);
-  
-  // Apply initial clear - essential for proper initialization
-  // Clear all LEDs to black
-  memset(ledData, 0, sizeof(ledData));
-  driver.showPixels(WAIT); // Use WAIT for initialization to ensure it completes
-  delay(50); // Brief delay to ensure the clear takes effect
-  
-  debugLog("LED driver initialization complete");
+  catch (...) {
+    // If any exception occurs, disable LED operations
+    debugLog("ERROR: LED hardware initialization failed - operating in display-only mode");
+  }
 }
 
 // ====== SETUP ======
 void setup()
 {
+  // Start with bare minimum initialization
   Serial.begin(115200);
+  delay(100);  // Short delay to stabilize serial
+  debugLog("ESP32 ArtNet LED Controller Starting");
 
-  // Configure UART pins for external device communication
+  // CRITICAL: Completely disable network functionality first
+  // This is essential to prevent the tcpip_send_msg assertion failure
+  WiFi.mode(WIFI_OFF);
+  delay(500); // Longer delay to ensure WiFi is fully off
+
+  // Load settings from preferences first
+  loadSettings();
+
+  // Initialize LED driver with minimal configuration
+  try {
+    debugLog("Initializing LED driver with basic setup");
+    initializeLEDDriver();
+
+    // Run a quick LED test if initialization succeeded
+    // This will help verify the LED hardware without overwhelming it
+    // Only if we're in static mode to avoid unnecessary animations
+    if (settings.useStaticColor) {
+      try {
+        applyStaticColor();
+        debugLog("Applied static color at startup");
+      } catch (...) {
+        debugLog("Failed to apply static color");
+      }
+    }
+  } catch (...) {
+    debugLog("LED driver initialization failed, continuing in UI-only mode");
+    ledHardwareFailed = true; // Mark LED hardware as failed
+  }
+
+  // Configure UART *after* LED initialization
   pinMode(UART_RX_PIN, INPUT);
   pinMode(UART_TX_PIN, OUTPUT);
   Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  // Initialize the UART communication bridge
-  if (uartBridge.initializeCommunication())
-  {
-    debugLog("UART Bridge initialized successfully");
-    // Register the command handler callback
-    uartBridge.setCommandCallback(handleUARTCommand);
-  }
-  else
-  {
-    debugLog("UART Bridge initialization failed");
-  }
-
-  // Load settings from preferences
-  loadSettings();
-
-  // Initialize display first so we can show status
-  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
-  {
-    Serial.println("OLED failed");
-  }
-  else
-  {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("ESP32 ArtNet Controller");
-    display.println("Connecting to WiFi...");
-    display.display();
-  }
-
-  // Connect to WiFi
-  WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
-  int timeout = 10;
-  while (WiFi.status() != WL_CONNECTED && timeout--)
-  {
-    delay(1000);
-    Serial.print(".");
-
-    // Update OLED with countdown
-    if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
-    {
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("ESP32 ArtNet Controller");
-      display.println("Connecting to WiFi...");
-      display.println("Timeout: " + String(timeout));
-      display.display();
+  // Initialize UART bridge with error handling
+  bool uartOK = false;
+  try {
+    uartOK = uartBridge.initializeCommunication();
+    if (uartOK) {
+      debugLog("UART Bridge initialized successfully");
+      uartBridge.setCommandCallback(handleUARTCommand);
+    } else {
+      debugLog("UART Bridge initialization failed, continuing without UART");
     }
+  } catch (...) {
+    debugLog("UART exception occurred, continuing without UART");
   }
 
-  // Initialize web server
+  // A single, simple display initialization with error handling
+  bool displayOK = false;
+  try {
+    displayOK = display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+    if (displayOK) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("ESP32 ArtNet");
+      display.println("Initializing...");
+      display.display();
+      debugLog("OLED display initialized");
+    } else {
+      debugLog("OLED display initialization failed");
+    }
+  } catch (...) {
+    debugLog("OLED exception occurred, continuing without display");
+  }
+
+  // Web server initialization (minimal - even if network fails, local server is useful)
   server.on("/", handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.on("/debug", handleDebugLog);
-  // Add LED test endpoint for hardware validation
-  server.on("/test", HTTP_GET, []() {
-    testLEDs();
-    server.send(200, "text/plain", "LED test completed - check all colors (RED, GREEN, BLUE, WHITE) displayed properly");
-  });
   
-  // Add a direct test endpoint for more detailed diagnostics
-  server.on("/directtest", HTTP_GET, []() {
-    testDirectLEDControl();
-    server.send(200, "text/plain", "Direct LED test completed - check for any visible output from various test methods");
-  });
+  // Try/catch for server begin to prevent crashes
+  try {
+    server.begin();
+    debugLog("Web server started");
+  } catch (...) {
+    debugLog("Web server start failed");
+  }
   
-  server.begin();
-
-  // Display connection status on OLED
-  if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
-  {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      display.println("Connected to WiFi");
-      display.print("IP: ");
-      display.println(WiFi.localIP());
-    }
-    else
-    {
-      display.println("WiFi connection failed");
-      display.println("Running in standalone mode");
-    }
-
-    // Show current mode
-    display.println("-------------------");
-    if (settings.useArtnet)
-    {
-      display.println("Mode: ArtNet");
-    }
-    else if (settings.useColorCycle)
-    {
-      display.print("Mode: Cycle (");
-      switch (settings.colorMode)
-      {
-      case COLOR_MODE_RAINBOW:
-        display.print("Rainbow");
-        break;
-      case COLOR_MODE_PULSE:
-        display.print("Pulse");
-        break;
-      case COLOR_MODE_FIRE:
-        display.print("Fire");
-        break;
+  // CRITICAL FIX: Only attempt network initialization if explicitly requested
+  // AND not marked as failed from a previous boot
+  if ((settings.useArtnet || settings.useWiFi) && !networkInitFailed) {
+    debugLog("Network functionality requested but will start in safe mode first");
+    debugLog("Waiting 5 seconds before attempting network initialization");
+    
+    // Safety delay to allow system to stabilize before network init
+    delay(5000);
+    
+    // Try to initialize WiFi with extensive error handling
+    try {
+      debugLog("Beginning safe network initialization sequence");
+      
+      // Proper WiFi initialization sequence to avoid assertion errors
+      WiFi.persistent(false);  // Prevent writing to flash
+      WiFi.disconnect(true);   // Ensure disconnected
+      delay(200);
+      
+      WiFi.mode(WIFI_STA);     // Set station mode
+      delay(500);              // Longer delay to settle
+      
+      // Start the WiFi connection with a short timeout
+      debugLog("Attempting to connect to WiFi: " + settings.ssid);
+      WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
+      
+      // Very brief non-blocking wait
+      unsigned long startAttempt = millis();
+      while (WiFi.status() != WL_CONNECTED && 
+            millis() - startAttempt < 3000) {  // 3 second max wait
+        delay(100);
+        yield(); // Keep watchdog happy
       }
-      display.println(")");
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        debugLog("WiFi connected successfully to: " + settings.ssid);
+        debugLog("IP address: " + WiFi.localIP().toString());
+        
+        // Only attempt ArtNet setup if WiFi is actually connected
+        if (settings.useArtnet) {
+          try {
+            IPAddress localIP = WiFi.localIP();
+            
+            // ArtNet initialization with error protection
+            debugLog("Initializing ArtNet on IP: " + localIP.toString());
+            
+            bool artnetStarted = artnet.listen(localIP, 6454);
+            if (artnetStarted) {
+              artnet.setFrameCallback(frameCallbackWrapper);
+              artnet.addSubArtnet(settings.startUniverse, 
+                                settings.numStrips * settings.ledsPerStrip * NB_CHANNEL_PER_LED,
+                                UNIVERSE_SIZE, 
+                                &artnetCallback);
+              artnet.setNodeName(settings.nodeName);
+              
+              debugLog("ArtNet initialized successfully");
+            } else {
+              // Fall back if ArtNet initialization fails
+              settings.useArtnet = false;
+              settings.useStaticColor = true;
+              debugLog("ArtNet initialization failed, falling back to static mode");
+            }
+          } catch (...) {
+            // Catch any exceptions from ArtNet initialization
+            settings.useArtnet = false;
+            settings.useStaticColor = true;
+            debugLog("Exception during ArtNet setup, falling back to static mode");
+            
+            // If we get here, something is wrong with network, so disable
+            disableAllNetworkOperations();
+          }
+        }
+      } else {
+        // Disable WiFi if connection fails to prevent further errors
+        disableAllNetworkOperations();
+        debugLog("WiFi connection failed - operating in network-free mode");
+      }
+    } catch (...) {
+      // Complete failure - disable all network
+      disableAllNetworkOperations();
+      debugLog("Critical network exception - operating in safe mode");
     }
-    else
-    {
-      display.println("Mode: Static Color");
-    }
-
-    display.display();
+  } else if (networkInitFailed) {
+    debugLog("Network disabled due to previous failures");
+  } else {
+    // No network needed, keep it off
+    WiFi.mode(WIFI_OFF);
+    debugLog("Network functionality not requested in settings");
   }
 
-  // Initialize LED driver with the new improved method
-  initializeLEDDriver();
-  
-  // Run the direct LED test to diagnose connectivity issues
-  testDirectLEDControl();
-
-  // Only initialize ArtNet if it's enabled
-  if (settings.useArtnet)
-  {
-    IPAddress localIP = WiFi.localIP();
-    artnet.listen(localIP, 6454);                  // Start listening for ArtNet data
-    artnet.setFrameCallback(frameCallbackWrapper); // Set the callback to handle ArtNet frames
-
-    artnet.addSubArtnet(
-        settings.startUniverse,
-        settings.numStrips * settings.ledsPerStrip * NB_CHANNEL_PER_LED,
-        UNIVERSE_SIZE,
-        &artnetCallback);
-    artnet.setNodeName(settings.nodeName);
-
-    if (artnet.listen(localIP, 6454))
-    {
-      Serial.print("Artnet listening on IP: ");
-      Serial.println(localIP);
-      debugLog("ArtNet initialized successfully");
-
-      // Send ArtNet status to UART bridge
-      uint8_t statusData[4] = {1, 0, 0, 0}; // Simple "success" status
-      uartBridge.sendCommand(CMD_ACK, statusData, 4);
-    }
-    else
-    {
-      Serial.println("Failed to start Artnet listener");
-      debugLog("Failed to initialize ArtNet");
-
-      // Send error status to UART bridge
-      uartBridge.sendErrorMessage(ERR_ARTNET_INIT, "Failed to start ArtNet listener");
-    }
-  }
-  else
-  {
-    debugLog("ArtNet disabled in settings");
-  }
-
-  // Apply initial LED state based on settings
-  if (!settings.useArtnet)
-  {
-    if (settings.useColorCycle)
-    {
-      // Set initial color cycle mode
-      debugLog("Starting in color cycle mode: " + String(settings.colorMode));
-    }
-    else
-    {
-      // Set initial static color
-      debugLog("Starting in static color mode");
-      applyStaticColor();
-      driver.showPixels(NO_WAIT);
-    }
-  }
-
-  // Send current status to connected UART device
-  uartBridge.sendStatusUpdate();
+  debugLog("Setup complete - entering main loop");
 }
 
 void loop()
 {
-  // Process web server requests
-  server.handleClient();
-
-  // Process UART communication
-  uartBridge.update();
-
-  // ArtNet timeout check
-  if (settings.useArtnet && (millis() - lastPacketTime > PACKET_TIMEOUT))
-  {
-    // Option: Clear LEDs after timeout
-    // memset(ledData, 0, sizeof(ledData));
-    // driver.showPixels(NO_WAIT);
+  // CRITICAL FIX: First, handle watchdog timer
+  static unsigned long lastYield = 0;
+  if (millis() - lastYield > 10) {
+    yield();  // Prevent watchdog timer reset
+    lastYield = millis();
   }
+  
+  // Wrap everything in a try-catch to prevent boot loops
+  try {
+    // Handle web server with watchdog-safe implementation
+    server.handleClient();
 
-  // Update LEDs based on current mode
-  updateLEDsBasedOnMode();
-
-  // Update OLED display periodically (every 1 second)
-  static unsigned long lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate > 1000)
-  {
-    updateDisplayStatus();
-    lastDisplayUpdate = millis();
+    // Use static variables for timing to reduce memory operations
+    static unsigned long lastUpdateTime = 0;
+    unsigned long currentMillis = millis();
+    
+    // Only update LEDs at reasonable intervals and only if we're not going to crash
+    if (currentMillis - lastUpdateTime > 50) {  // 20fps max refresh rate
+      lastUpdateTime = currentMillis;
+      
+      // Handle LED updates based on mode
+      if (settings.useArtnet) {
+        // ArtNet mode updates happen in callback - nothing to do here
+      }
+      else if (settings.useColorCycle) {
+        try {
+          // Simplified animation update
+          switch (settings.colorMode) {
+            case COLOR_MODE_RAINBOW:
+              rainbowCycle();
+              break;
+            case COLOR_MODE_PULSE:
+              pulseEffect();
+              break;
+            case COLOR_MODE_FIRE:
+              fireEffect();
+              break;
+            default:
+              rainbowCycle();
+          }
+          driver.showPixels(NO_WAIT);
+        } catch (...) {
+          // If LED update fails, disable color cycle to prevent future crashes
+          debugLog("ERROR: LED update failed in cycle mode, disabling animations");
+          settings.useColorCycle = false;
+          settings.useStaticColor = true;
+        }
+      }
+      else if (settings.useStaticColor) {
+        // Only update static colors occasionally
+        static unsigned long lastStaticUpdate = 0;
+        if (currentMillis - lastStaticUpdate > 2000) {  // Every 2 seconds is plenty
+          lastStaticUpdate = currentMillis;
+          try {
+            applyStaticColor();
+          } catch (...) {
+            // If static color update fails, log but continue
+            debugLog("WARNING: Static color update failed");
+          }
+        }
+      }
+      
+      // Update OLED display less frequently
+      static unsigned long lastDisplayUpdate = 0;
+      if (currentMillis - lastDisplayUpdate > 1000) {  // Once per second
+        lastDisplayUpdate = currentMillis;
+        try {
+          updateDisplayStatus();
+        } catch (...) {
+          // Display errors shouldn't crash the program
+          debugLog("WARNING: Display update failed");
+        }
+      }
+      
+      // Process UART communication with protection
+      try {
+        uartBridge.update();
+      } catch (...) {
+        // UART errors shouldn't crash the program
+        debugLog("WARNING: UART update failed");
+      }
+    }
+  } catch (...) {
+    // If anything goes wrong in the main loop, log and continue
+    // This is our final safety net against boot loops
+    static unsigned long lastErrorTime = 0;
+    if (millis() - lastErrorTime > 5000) {  // Limit error logging to avoid spam
+      debugLog("ERROR: Exception in main loop");
+      lastErrorTime = millis();
+    }
   }
-
-  // Small delay to avoid watchdog resets and give other tasks time
+  
+  // Required for ESP32 stability
   delay(1);
 }

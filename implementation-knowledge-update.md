@@ -245,3 +245,149 @@ For WS2812B LEDs, color data needs specific formatting:
 3. More advanced animations
 4. Audio-reactive effects
 5. Scene storage and recall
+
+## Boot Loop Issue Analysis (April 2025 Update)
+
+### Persistent Boot Loop Problem
+Despite previous fixes and error handling improvements, a persistent boot loop issue has been identified under certain conditions. This critical issue manifests as follows:
+
+1. **Symptoms**:
+   - ESP32 continuously reboots without stabilizing
+   - Serial output may show tcpip_send_msg assertion failure
+   - LEDs may briefly initialize then fail before the device reboots
+   - Device never reaches stable operation state
+
+2. **Identified Root Causes**:
+   - **LED Driver Initialization Timing**: Insufficient timing management between initialization steps
+   - **Network/LED Driver Interaction**: Conflicts between WiFi stack and LED driver timing requirements
+   - **Error Handling Gaps**: Some exceptions during initialization trigger watchdog timer resets
+   - **Resource Contention**: Memory allocation conflicts between different subsystems
+
+3. **Current Mitigation Strategies**:
+   - Basic try/catch blocks around critical operations
+   - `disableAllNetworkOperations()` function to handle tcpip assertion failures
+   - Global flags to track critical failures (networkInitFailed, ledHardwareFailed)
+   - Yield calls in main loop to prevent watchdog timer resets
+
+### Proposed Solutions
+
+1. **Enhanced LED Driver Initialization**:
+   - Implement multi-stage fallback initialization approach
+   - Progressive test from full configuration to minimal configuration
+   - Hardware verification steps between initialization stages
+   - Proper delay sequencing between critical operations
+
+2. **Boot Counter for Safe Mode Enforcement**:
+   - Store boot count and timestamps in non-volatile preferences
+   - Force safe mode after multiple failed boot attempts
+   - Implement escalating fallback strategies
+   - Reset counters after successful operation period
+
+3. **Complete Separation of Network and LED Operations**:
+   - Ensure temporal separation between WiFi and LED operations
+   - Use semaphores or other synchronization mechanisms
+   - Clear memory barriers between subsystems
+   - Strategic disabling of WiFi during critical LED operations
+
+4. **Enhanced Diagnostics**:
+   - More detailed logging of initialization sequence
+   - Preserving error logs across reboots
+   - Hardware state validation at key points
+   - Indicators for specific failure modes
+
+### Implementation Design
+
+The following design patterns should be considered for implementation:
+
+1. **Progressive Fallback Initialization**:
+   ```cpp
+   bool initLEDDriver() {
+     // Try full configuration first
+     if (tryFullConfig()) return true;
+     
+     // If that fails, try reduced configuration
+     if (tryReducedConfig()) return true;
+     
+     // Last resort - minimal configuration
+     if (tryMinimalConfig()) return true;
+     
+     // All attempts failed
+     return false;
+   }
+   ```
+
+2. **Boot Counter Implementation**:
+   ```cpp
+   void manageBootCount() {
+     preferences.begin("esp-artnet", false);
+     int bootCount = preferences.getInt("bootCount", 0);
+     bootCount++;
+     
+     if (bootCount > 3) {
+       // Force safe mode after multiple reboots
+       enableSafeMode();
+     }
+     
+     // Update boot time and counter
+     preferences.putInt("bootCount", bootCount);
+     preferences.putLong("lastBootTime", millis());
+     preferences.end();
+   }
+   ```
+
+3. **Safe Mode Operations**:
+   ```cpp
+   void enableSafeMode() {
+     // Disable all non-essential functionality
+     networkInitFailed = true;
+     settings.useArtnet = false;
+     settings.useWiFi = false;
+     
+     // Use minimal LED configuration
+     settings.numStrips = 1;
+     settings.ledsPerStrip = 8;
+     settings.brightness = 64;
+     
+     // Visual indicator of safe mode
+     settings.useStaticColor = true;
+     settings.staticColor = {255, 0, 0}; // Red = safe mode
+     
+     debugLog("SAFE MODE ENABLED: Multiple boot failures detected");
+   }
+   ```
+
+## Collaborative Development Insights
+
+### AI-Assisted Development Process
+The development cycle between GitHub Copilot and Claude AI revealed several important insights:
+
+1. **Knowledge Transfer Challenges**:
+   - Detailed error context needs to be explicitly captured and communicated
+   - Hardware-specific behaviors are difficult to diagnose without direct observation
+   - Context continuity between sessions requires structured documentation
+
+2. **Effective Collaboration Patterns**:
+   - Explicitly documenting hypotheses before testing
+   - Creating minimal reproducible test cases
+   - Maintaining decision logs of attempted solutions
+   - Systematic approach to testing each subsystem in isolation
+
+3. **Implementation Strategy Improvements**:
+   - Incremental changes with verification at each step
+   - Creating parallel implementations to compare approaches
+   - Using preprocessor flags to toggle between implementations
+   - Comprehensive instrumentation for diagnosis
+
+### Moving Forward
+For continued development, the following methodologies are recommended:
+
+1. **Systematic Debugging Approach**:
+   - Create diagnostic builds with enhanced logging
+   - Develop reproducible test patterns for hardware validation
+   - Implement self-test routines that report detailed diagnostics
+
+2. **Development Workflow**:
+   - Begin with explicit hypothesis about failure modes
+   - Implement isolated tests for each subsystem
+   - Document all observations and results
+   - Use progressive refinement with measurement at each stage
