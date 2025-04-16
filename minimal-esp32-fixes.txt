@@ -1,0 +1,209 @@
+/*
+ * ESP32 ArtNet to I2CClockless - Targeted Fixes
+ * 
+ * This patch fixes the critical issues in the esp-gpt-i2c repo while
+ * preserving the original structure and I2CClockless implementation.
+ * 
+ * Main fixes:
+ * 1. Proper DMX data path for static mode
+ * 2. Fixed mode switching logic
+ * 3. Correct preference loading/saving
+ * 4. LED strip initialization with proper params
+ */
+
+// === DMX Processing Function Fix ===
+// Replace the existing onDmxFrame function with this one:
+
+void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* data) {
+  sendFeedback(ARTNET_RECEIVED, 0);
+
+  // Save last received DMX data for use in static mode
+  if (length > DMX_MAX_FRAME) length = DMX_MAX_FRAME;
+  memcpy(dmxData, data, length);
+  
+  // If in static mode, directly update LEDs from DMX data
+  if (operationMode == MODE_STATIC) {
+    updateStaticMode();
+  }
+  
+  lastPacketTime = millis();
+  packetsReceived++;
+}
+
+// === Add a dedicated static mode update function ===
+// Add this new function to handle static mode updates:
+
+void updateStaticMode() {
+  // Map DMX data to RGB buffer (3 channels per LED: R,G,B)
+  for (int i = 0; i < stripConfig.ledCount; i++) {
+    int dmxPos = i * 3;
+    
+    // Ensure we don't exceed DMX channels
+    if (dmxPos + 2 < DMX_MAX_FRAME) {
+      rgbBuffer[i * 3]     = dmxData[dmxPos];     // R
+      rgbBuffer[i * 3 + 1] = dmxData[dmxPos + 1]; // G
+      rgbBuffer[i * 3 + 2] = dmxData[dmxPos + 2]; // B
+    }
+  }
+  
+  // Update LEDs with new data
+  updateLEDs();
+}
+
+// === Fix LED initialization function ===
+// Replace the existing initLEDs function with this one:
+
+void initLEDs() {
+  // Free previous instance if it exists
+  if (ledsInitialized) {
+    ledStrip.free();
+    ledsInitialized = false;
+  }
+  
+  // Clear RGB buffer
+  memset(rgbBuffer, 0, sizeof(rgbBuffer));
+  
+  // Configure and initialize LED strip with current preferences
+  int channels = 1; // Single strip mode
+  uint8_t pins[] = {(uint8_t)stripConfig.pin};
+  uint16_t lengths[] = {(uint16_t)stripConfig.ledCount};
+  
+  // Initialize with I2CClockless
+  ledStrip.begin(pins, channels, COLOR_FORMAT, lengths);
+  ledsInitialized = true;
+  
+  Serial.printf("LED strip initialized: Pin %d, %d LEDs\n", 
+                stripConfig.pin, stripConfig.ledCount);
+                
+  // Clear LEDs on startup
+  updateLEDs();
+}
+
+// === Fix LED update function ===
+// Replace the existing updateLEDs function with this one:
+
+void updateLEDs() {
+  if (!ledsInitialized) return;
+  
+  // Transfer RGB data to LED strip and show
+  ledStrip.write(0, 0, stripConfig.ledCount, rgbBuffer);
+}
+
+// === Fix mode switching function ===
+// Replace the existing setMode function with this one:
+
+void setMode(uint8_t mode) {
+  if (mode >= MODE_COUNT) {
+    return; // Invalid mode
+  }
+  
+  // Update operation mode
+  operationMode = mode;
+  
+  // Save preference for persistence
+  preferences.begin("artnet", false);
+  preferences.putUInt("mode", operationMode);
+  preferences.end();
+  
+  // Clear LEDs when switching modes
+  memset(rgbBuffer, 0, MAX_LEDS_PER_STRIP * 3);
+  updateLEDs();
+  
+  // Reset animation step counter if switching to animation mode
+  if (operationMode != MODE_STATIC) {
+    animationStep = 0;
+  }
+  
+  Serial.printf("Mode set to %d\n", operationMode);
+}
+
+// === Fix loop function ===
+// Replace the existing loop function with this one:
+
+void loop() {
+  // Handle incoming web requests
+  if (webServer) {
+    webServer->handleClient();
+  }
+  
+  // If in static mode and we have DMX data from ArtNet, continuously update
+  if (operationMode == MODE_STATIC) {
+    // Static mode is handled directly in onDmxFrame
+    // But we can detect timeouts here
+    if (millis() - lastPacketTime > PACKET_TIMEOUT) {
+      // Option: clear LEDs if no packets for a while
+      // memset(rgbBuffer, 0, stripConfig.ledCount * 3);
+      // updateLEDs();
+    }
+  } 
+  // Handle animation modes
+  else if (millis() - lastAnimationTime > ANIMATION_DELAY) {
+    lastAnimationTime = millis();
+    
+    // Run the appropriate animation based on current mode
+    switch (operationMode) {
+      case MODE_RAINBOW:
+        updateRainbowMode();
+        break;
+      case MODE_PULSE:
+        updatePulseMode();
+        break;
+      case MODE_CHASE:
+        updateChaseMode();
+        break;
+      // Add other animation modes here
+    }
+    
+    // Update LEDs with animation data
+    updateLEDs();
+    
+    // Increment animation counter
+    animationStep++;
+  }
+  
+  // Small delay to prevent WDT reset
+  delay(1);
+}
+
+// === Fix preferences loading ===
+// Replace or modify the loadPreferences function:
+
+void loadPreferences() {
+  preferences.begin("artnet", false);
+  
+  // Load strip configuration
+  stripConfig.pin = preferences.getUInt("pin", DEFAULT_LED_PIN);
+  stripConfig.ledCount = preferences.getUInt("ledcount", DEFAULT_LED_COUNT);
+  
+  // Load operation mode
+  operationMode = preferences.getUInt("mode", MODE_STATIC);
+  
+  preferences.end();
+  
+  Serial.println("Loaded preferences:");
+  Serial.printf("LED Pin: %d\n", stripConfig.pin);
+  Serial.printf("LED Count: %d\n", stripConfig.ledCount);
+  Serial.printf("Mode: %d\n", operationMode);
+}
+
+// === Fix API endpoint for mode setting ===
+// Add or replace the API endpoint for setting the mode:
+
+void handleSetModeAPI() {
+  if (!webServer->hasArg("mode")) {
+    webServer->send(400, "text/plain", "Missing mode parameter");
+    return;
+  }
+  
+  int mode = webServer->arg("mode").toInt();
+  if (mode < 0 || mode >= MODE_COUNT) {
+    webServer->send(400, "text/plain", "Invalid mode value");
+    return;
+  }
+  
+  // Set the new mode
+  setMode(mode);
+  
+  // Send success response
+  webServer->send(200, "application/json", "{\"status\":\"success\",\"mode\":" + String(mode) + "}");
+}

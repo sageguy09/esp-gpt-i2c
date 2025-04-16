@@ -6,6 +6,11 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
+// Define constants that are used early in the code
+#define UNIVERSE_SIZE 510
+#define MAX_STRIPS 12       // 4 pins × 3 strips per pin
+#define PACKET_TIMEOUT 5000 // 5 seconds without packets is a timeout
+
 // This must be defined before including I2SClocklessLedDriver.h
 #ifndef NUM_LEDS_PER_STRIP
 #define NUM_LEDS_PER_STRIP 144 // Define this before library includes
@@ -15,6 +20,22 @@
 #include "artnetESP32V2.h"
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include "UARTCommunicationBridge.h"
+
+// Define the UART pin configuration for the communication bridge
+#define UART_RX_PIN 16 // GPIO pin for UART RX
+#define UART_TX_PIN 17 // GPIO pin for UART TX
+
+// Create a UART bridge instance using Serial2
+UARTCommunicationBridge uartBridge(Serial2);
+
+// UART command handler callback
+void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length);
+
+// DMX data buffer for storing the most recent ArtNet data
+uint8_t dmxData[UNIVERSE_SIZE];
+unsigned long lastPacketTime = 0;
+uint32_t packetsReceived = 0;
 
 // ====== CONFIGURATION ======
 #define STATUS_LED_PIN 16
@@ -23,10 +44,8 @@
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-#define MAX_STRIPS 12 // 4 pins × 3 strips per pin
 #define NUMSTRIPS 1
 #define NB_CHANNEL_PER_LED 3
-#define UNIVERSE_SIZE 510
 #define STRIPS_PER_PIN 3
 
 #define DEBUG_ENABLED true
@@ -79,7 +98,7 @@ struct Settings
 } settings = {
     .numStrips = 1,
     .ledsPerStrip = 144,
-    .pins = {12, 14, 2, 4},
+    .pins = {12, -1, -1, -1}, // Only pin 12 active by default, others disabled
     .brightness = 255,
     .ssid = "Sage1",
     .password = "J@sper123",
@@ -88,12 +107,12 @@ struct Settings
     .startUniverse = 0,
 
     // Default values for new settings
-    .useArtnet = true,
+    .useArtnet = false, // Default to static color mode instead of ArtNet
     .useColorCycle = false,
-    .useStaticColor = false, // Static color disabled by default
+    .useStaticColor = true, // Static color enabled by default
     .colorMode = COLOR_MODE_RAINBOW,
-    .staticColor = {255, 0, 0}, // Default to red
-    .cycleSpeed = 50            // Medium speed
+    .staticColor = {255, 0, 255}, // Default to magenta (red+blue) for visibility
+    .cycleSpeed = 50              // Medium speed
 };
 
 struct State
@@ -337,11 +356,12 @@ void handleConfig()
   driver.setBrightness(settings.brightness);
 
   // For pin changes, we need to re-initialize the LED driver
-  driver.initled(NULL, settings.pins, 3, settings.ledsPerStrip * STRIPS_PER_PIN);
+  // Only use the first pin (pin 12 by default) for a single strip
+  int activePins[1] = {settings.pins[0]};
+  driver.initled(NULL, activePins, 1, settings.ledsPerStrip);
 
-  debugLog("Settings updated - Pins: " + String(settings.pins[0]) + "," +
-           String(settings.pins[1]) + "," + String(settings.pins[2]) + "," +
-           String(settings.pins[3]));
+  debugLog("LED strip reconfigured on pin: " + String(settings.pins[0]) +
+           " with " + String(settings.ledsPerStrip) + " LEDs");
 
   // Redirect back to root page
   server.sendHeader("Location", "/", true);
@@ -353,10 +373,16 @@ void artnetCallback(void *param)
 {
   subArtnet *sub = (subArtnet *)param;
 
-  // Get ArtNet data from the packet and update LED colors
+  // Get ArtNet data from the packet
   uint8_t *data = sub->getData();
   int dataLength = sub->_nb_data;
 
+  // Save a copy of the DMX data for use in static mode
+  if (dataLength > UNIVERSE_SIZE)
+    dataLength = UNIVERSE_SIZE;
+  memcpy(dmxData, data, dataLength);
+
+  // Update LED colors from DMX data
   for (int i = 0; i < dataLength; i += NB_CHANNEL_PER_LED)
   {
     int ledIndex = i / NB_CHANNEL_PER_LED;
@@ -368,9 +394,20 @@ void artnetCallback(void *param)
     }
   }
 
-  // Update the LEDs with the new data
+  // Always update LEDs immediately for ArtNet data
   driver.showPixels(NO_WAIT);
   sendFrame = true;
+
+  // Update tracking variables
+  lastPacketTime = millis();
+  packetsReceived++;
+
+  // Send status via UART if bridge is initialized
+  if (uartBridge.getLastError() == ERR_NONE)
+  {
+    uint8_t statusData[4] = {0x01, 0x00, 0x00, 0x00}; // Simple status packet
+    uartBridge.sendCommand(CMD_DMX_DATA, statusData, 4);
+  }
 }
 
 // Wrapper function for the frame callback to match the expected signature
@@ -378,6 +415,90 @@ void frameCallbackWrapper()
 {
   // This is just a wrapper to match the signature expected by setFrameCallback
   // The actual callback processing happens in artnetCallback when called by the subArtnet
+}
+
+// Handler for UART commands - implement specific behavior for each command
+void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
+{
+  debugLog("UART command received: " + String(cmd, HEX));
+
+  switch (cmd)
+  {
+  case CMD_SET_MODE:
+    if (length >= 1)
+    {
+      uint8_t mode = data[0];
+      if (mode == 0)
+      {
+        // ArtNet mode
+        settings.useArtnet = true;
+        settings.useStaticColor = false;
+        settings.useColorCycle = false;
+      }
+      else if (mode == 1)
+      {
+        // Static color mode
+        settings.useArtnet = false;
+        settings.useStaticColor = true;
+        settings.useColorCycle = false;
+      }
+      else if (mode == 2)
+      {
+        // Color cycle mode
+        settings.useArtnet = false;
+        settings.useStaticColor = false;
+        settings.useColorCycle = true;
+
+        // Set specific animation if provided
+        if (length >= 2 && data[1] <= COLOR_MODE_FIRE)
+        {
+          settings.colorMode = data[1];
+        }
+      }
+      saveSettings();
+
+      // Acknowledge the mode change
+      uartBridge.sendCommand(CMD_ACK, &mode, 1);
+    }
+    break;
+
+  case CMD_SET_BRIGHTNESS:
+    if (length >= 1)
+    {
+      settings.brightness = data[0];
+      driver.setBrightness(settings.brightness);
+      saveSettings();
+      // Fix the type mismatch by creating a uint8_t variable
+      uint8_t brightnessValue = settings.brightness;
+      uartBridge.sendCommand(CMD_ACK, &brightnessValue, 1);
+    }
+    break;
+
+  case CMD_SET_COLOR:
+    if (length >= 3)
+    {
+      settings.staticColor.r = data[0];
+      settings.staticColor.g = data[1];
+      settings.staticColor.b = data[2];
+
+      // If in static color mode, apply immediately
+      if (settings.useStaticColor)
+      {
+        applyStaticColor();
+        driver.showPixels(NO_WAIT);
+      }
+
+      saveSettings();
+      // Use the data directly since it's already uint8_t*
+      uartBridge.sendCommand(CMD_ACK, data, 3);
+    }
+    break;
+
+  default:
+    // Unknown command
+    uartBridge.sendErrorMessage(ERR_INVALID_CMD, "Unknown command");
+    break;
+  }
 }
 
 // ====== COLOR FUNCTIONS ======
@@ -619,6 +740,96 @@ void updateLEDsBasedOnMode()
   driver.showPixels(NO_WAIT);
 }
 
+// Update the OLED display with current status information
+void updateDisplayStatus()
+{
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
+  {
+    return; // Display initialization failed
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  // Display WiFi and IP status
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    display.println("WiFi: Connected");
+    display.print("IP: ");
+    display.println(WiFi.localIP());
+  }
+  else
+  {
+    display.println("WiFi: Disconnected");
+    display.println("Standalone Mode");
+  }
+
+  // Display current mode
+  display.println("-------------------");
+  if (settings.useArtnet)
+  {
+    display.print("Mode: ArtNet");
+
+    // Show ArtNet statistics
+    display.print(" Pkts:");
+    display.print(packetsReceived);
+
+    // Show if recent data received
+    if (millis() - lastPacketTime < PACKET_TIMEOUT)
+    {
+      display.print(" LIVE");
+    }
+  }
+  else if (settings.useColorCycle)
+  {
+    display.print("Mode: Cycle (");
+    switch (settings.colorMode)
+    {
+    case COLOR_MODE_RAINBOW:
+      display.print("Rainbow");
+      break;
+    case COLOR_MODE_PULSE:
+      display.print("Pulse");
+      break;
+    case COLOR_MODE_FIRE:
+      display.print("Fire");
+      break;
+    default:
+      display.print(settings.colorMode);
+    }
+    display.println(")");
+    display.print("Speed: ");
+    display.print(settings.cycleSpeed);
+  }
+  else if (settings.useStaticColor)
+  {
+    display.println("Mode: Static Color");
+    display.print("RGB: ");
+    display.print(settings.staticColor.r);
+    display.print(",");
+    display.print(settings.staticColor.g);
+    display.print(",");
+    display.print(settings.staticColor.b);
+  }
+
+  // Display UART status and errors
+  display.setCursor(0, 24);
+  display.print("UART:");
+  if (uartBridge.getLastError() == ERR_NONE)
+  {
+    display.print("OK");
+  }
+  else
+  {
+    display.print("Err:");
+    display.print(uartBridge.getLastError(), HEX);
+  }
+
+  display.display();
+}
+
 // ====== SETTINGS FUNCTIONS ======
 void loadSettings()
 {
@@ -719,6 +930,23 @@ void setup()
 {
   Serial.begin(115200);
 
+  // Configure UART pins for external device communication
+  pinMode(UART_RX_PIN, INPUT);
+  pinMode(UART_TX_PIN, OUTPUT);
+  Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  // Initialize the UART communication bridge
+  if (uartBridge.initializeCommunication())
+  {
+    debugLog("UART Bridge initialized successfully");
+    // Register the command handler callback
+    uartBridge.setCommandCallback(handleUARTCommand);
+  }
+  else
+  {
+    debugLog("UART Bridge initialization failed");
+  }
+
   // Load settings from preferences
   loadSettings();
 
@@ -813,9 +1041,16 @@ void setup()
     display.display();
   }
 
-  // Initialize LED driver
+  // Initialize LED driver with correct parameters for a single strip on pin 12
   driver.setBrightness(settings.brightness);
-  driver.initled(NULL, settings.pins, 3, settings.ledsPerStrip * STRIPS_PER_PIN);
+
+  // Make sure we're only passing the active pins
+  int activePins[1] = {settings.pins[0]}; // Only use pin 12
+  driver.initled(NULL, activePins, 1, settings.ledsPerStrip);
+
+  // Debug output to show what pin we're using
+  debugLog("LED strip initialized on pin: " + String(settings.pins[0]) +
+           " with " + String(settings.ledsPerStrip) + " LEDs");
 
   // Only initialize ArtNet if it's enabled
   if (settings.useArtnet)
@@ -836,11 +1071,18 @@ void setup()
       Serial.print("Artnet listening on IP: ");
       Serial.println(localIP);
       debugLog("ArtNet initialized successfully");
+
+      // Send ArtNet status to UART bridge
+      uint8_t statusData[4] = {1, 0, 0, 0}; // Simple "success" status
+      uartBridge.sendCommand(CMD_ACK, statusData, 4);
     }
     else
     {
       Serial.println("Failed to start Artnet listener");
       debugLog("Failed to initialize ArtNet");
+
+      // Send error status to UART bridge
+      uartBridge.sendErrorMessage(ERR_ARTNET_INIT, "Failed to start ArtNet listener");
     }
   }
   else
@@ -864,10 +1106,38 @@ void setup()
       driver.showPixels(NO_WAIT);
     }
   }
+
+  // Send current status to connected UART device
+  uartBridge.sendStatusUpdate();
 }
 
 void loop()
 {
+  // Process web server requests
   server.handleClient();
+
+  // Process UART communication
+  uartBridge.update();
+
+  // ArtNet timeout check
+  if (settings.useArtnet && (millis() - lastPacketTime > PACKET_TIMEOUT))
+  {
+    // Option: Clear LEDs after timeout
+    // memset(ledData, 0, sizeof(ledData));
+    // driver.showPixels(NO_WAIT);
+  }
+
+  // Update LEDs based on current mode
   updateLEDsBasedOnMode();
+
+  // Update OLED display periodically (every 1 second)
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 1000)
+  {
+    updateDisplayStatus();
+    lastDisplayUpdate = millis();
+  }
+
+  // Small delay to avoid watchdog resets and give other tasks time
+  delay(1);
 }
