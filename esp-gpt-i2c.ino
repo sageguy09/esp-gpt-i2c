@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Adafruit_NeoPixel.h> // Add NeoPixel library for the test function
 
 // Define constants that are used early in the code
 #define UNIVERSE_SIZE 510
@@ -352,16 +353,18 @@ void handleConfig()
   // Save settings to preferences
   saveSettings();
 
-  // Update LED driver with new brightness
-  driver.setBrightness(settings.brightness);
-
-  // For pin changes, we need to re-initialize the LED driver
-  // Only use the first pin (pin 12 by default) for a single strip
-  int activePins[1] = {settings.pins[0]};
-  driver.initled(NULL, activePins, 1, settings.ledsPerStrip);
-
-  debugLog("LED strip reconfigured on pin: " + String(settings.pins[0]) +
-           " with " + String(settings.ledsPerStrip) + " LEDs");
+  // Properly reinitialize the LED driver with the improved function
+  // This ensures all pin changes and other configuration updates are applied
+  initializeLEDDriver();
+  
+  debugLog("LED configuration updated: strips=" + String(settings.numStrips) + 
+           ", ledsPerStrip=" + String(settings.ledsPerStrip) + 
+           ", brightness=" + String(settings.brightness));
+  
+  // If we're in static color mode, immediately apply the color
+  if (settings.useStaticColor) {
+    applyStaticColor();
+  }
 
   // Redirect back to root page
   server.sendHeader("Location", "/", true);
@@ -477,19 +480,30 @@ void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
   case CMD_SET_COLOR:
     if (length >= 3)
     {
+      // Update color settings
       settings.staticColor.r = data[0];
       settings.staticColor.g = data[1];
       settings.staticColor.b = data[2];
+      
+      // Log the color change
+      debugLog("UART: Setting color to R=" + String(data[0]) + 
+               ", G=" + String(data[1]) + 
+               ", B=" + String(data[2]));
 
-      // If in static color mode, apply immediately
+      // If in static color mode, apply the color immediately with improved method
       if (settings.useStaticColor)
       {
+        // Critical: reinitialize driver to ensure clean state
+        initializeLEDDriver();
+        
+        // Apply the static color with the improved method
         applyStaticColor();
-        driver.showPixels(NO_WAIT);
       }
 
+      // Save to persistent storage
       saveSettings();
-      // Use the data directly since it's already uint8_t*
+      
+      // Acknowledge the command
       uartBridge.sendCommand(CMD_ACK, data, 3);
     }
     break;
@@ -504,6 +518,95 @@ void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
 // ====== COLOR FUNCTIONS ======
 unsigned long lastColorUpdate = 0;
 uint8_t cyclePosition = 0;
+
+// Test function for LED hardware diagnosis that combines multiple test methods
+void testDirectLEDControl() {
+  debugLog("Starting comprehensive LED test...");
+  
+  // Test 1: Using I2SClocklessLedDriver directly
+  debugLog("Test 1: Using I2SClocklessLedDriver directly");
+  
+  // Clear all LEDs first
+  memset(ledData, 0, sizeof(ledData));
+  driver.showPixels(WAIT);
+  delay(100);
+  
+  // Set all LEDs to RED
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  delay(1000);
+  
+  // Set all LEDs to GREEN
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 255;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  delay(1000);
+  
+  // Test 2: Using Adafruit_NeoPixel for comparison
+  debugLog("Test 2: Using Adafruit_NeoPixel library for comparison");
+  
+  // Create NeoPixel strip with the same configuration
+  Adafruit_NeoPixel strip(settings.ledsPerStrip, settings.pins[0], NEO_GRB + NEO_KHZ800);
+  strip.begin();
+  strip.setBrightness(settings.brightness);
+  
+  // Set all LEDs to BLUE
+  for(int i=0; i < settings.ledsPerStrip; i++) {
+    strip.setPixelColor(i, 0, 0, 255);
+  }
+  strip.show();
+  delay(1000);
+  
+  // Set all LEDs to MAGENTA
+  for(int i=0; i < settings.ledsPerStrip; i++) {
+    strip.setPixelColor(i, 255, 0, 255);
+  }
+  strip.show();
+  delay(1000);
+  
+  // Test 3: Reinitialize I2SClocklessLedDriver and test again
+  debugLog("Test 3: Reinitializing I2SClocklessLedDriver");
+  
+  // Reinitialize with specific pin configuration
+  int singlePin[1] = {settings.pins[0]};
+  driver.initled(NULL, singlePin, 1, settings.ledsPerStrip);
+  driver.setBrightness(settings.brightness);
+  
+  // Set all LEDs to YELLOW
+  for (int i = 0; i < settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 255;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(WAIT);
+  delay(1000);
+  
+  // Test 4: Try with direct buffer approach
+  debugLog("Test 4: Direct buffer approach");
+  uint8_t *directBuffer = (uint8_t*)malloc(settings.ledsPerStrip * 3);
+  if (directBuffer) {
+    for (int i = 0; i < settings.ledsPerStrip; i++) {
+      directBuffer[i*3] = 255;    // R
+      directBuffer[i*3+1] = 0;    // G
+      directBuffer[i*3+2] = 255;  // B
+    }
+    
+    driver.showPixels(WAIT, directBuffer);
+    delay(1000);
+    free(directBuffer);
+  }
+  
+  // Restore original LED driver configuration
+  debugLog("LED test complete, reinitializing driver");
+  initializeLEDDriver();
+}
 
 // Convert HSV to RGB
 rgb24 hsvToRgb(uint8_t h, uint8_t s, uint8_t v)
@@ -674,70 +777,149 @@ void fireEffect()
 }
 
 // Apply static color to all LEDs
-void applyStaticColor()
-{
-  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++)
-  {
-    ledData[i] = settings.staticColor;
+void applyStaticColor() {
+  if (!settings.useStaticColor) return;
+  
+  debugLog("Applying static color: R=" + String(settings.staticColor.r) + 
+           " G=" + String(settings.staticColor.g) + 
+           " B=" + String(settings.staticColor.b));
+  
+  // Critical: Clear any previous data
+  memset(ledData, 0, sizeof(ledData));
+  
+  // Apply color to all LEDs
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = settings.staticColor.r;
+    ledData[i].g = settings.staticColor.g;
+    ledData[i].b = settings.staticColor.b;
   }
+  
+  // Force immediate update with WAIT flag to ensure completion
+  // The WAIT parameter is critical for reliable static color updates
+  driver.showPixels(WAIT);
+  
+  // Additional verification - double-check the driver state
+  // This ensures the LEDs are in the correct state
+  driver.setBrightness(settings.brightness);
+  driver.showPixels(WAIT);
+  
+  debugLog("Static color applied successfully");
 }
 
 // Main function to update LEDs based on current mode
-void updateLEDsBasedOnMode()
-{
+void updateLEDsBasedOnMode() {
   unsigned long currentMillis = millis();
 
-  // Only update at the rate determined by cycleSpeed for animations
-  // Static color should be applied immediately when changed
-  if (!settings.useStaticColor && currentMillis - lastColorUpdate < (101 - settings.cycleSpeed))
-  {
-    return; // Not time to update yet for animations
-  }
-
-  lastColorUpdate = currentMillis;
-
-  if (settings.useArtnet)
-  {
-    // If ArtNet is enabled, don't overwrite LED data here
-    // It will be handled by ArtNet callback
+  // Skip updates for animations if not enough time has passed
+  if (!settings.useStaticColor && 
+      !settings.useArtnet && 
+      currentMillis - lastColorUpdate < (101 - settings.cycleSpeed)) {
     return;
   }
 
-  if (settings.useStaticColor)
-  {
-    // Static color has priority over color cycle
-    applyStaticColor();
-    debugLog("Applied static color: R=" + String(settings.staticColor.r) +
-             ", G=" + String(settings.staticColor.g) +
-             ", B=" + String(settings.staticColor.b));
-  }
-  else if (settings.useColorCycle)
-  {
-    // Apply the selected color cycling mode
-    switch (settings.colorMode)
-    {
-    case COLOR_MODE_RAINBOW:
-      rainbowCycle();
-      break;
-    case COLOR_MODE_PULSE:
-      pulseEffect();
-      break;
-    case COLOR_MODE_FIRE:
-      fireEffect();
-      break;
-    default:
-      rainbowCycle(); // Default to rainbow if mode is invalid
-    }
-  }
-  else
-  {
-    // If neither static color nor color cycling is enabled,
-    // still apply static color as a fallback
-    applyStaticColor();
+  lastColorUpdate = currentMillis;
+  
+  // ArtNet mode is handled separately in the callback
+  if (settings.useArtnet) {
+    return;
   }
 
-  // Update the LEDs with the new data
+  // Static color mode has priority
+  if (settings.useStaticColor) {
+    applyStaticColor();
+  } 
+  // Color cycle mode
+  else if (settings.useColorCycle) {
+    switch (settings.colorMode) {
+      case COLOR_MODE_RAINBOW:
+        rainbowCycle();
+        break;
+      case COLOR_MODE_PULSE:
+        pulseEffect();
+        break;
+      case COLOR_MODE_FIRE:
+        fireEffect();
+        break;
+      default:
+        rainbowCycle();
+        break;
+    }
+    
+    // Critical: Force update LEDs
+    driver.showPixels(NO_WAIT);
+  }
+  // Fallback to static color if nothing else is active
+  else {
+    applyStaticColor();
+  }
+}
+
+// Test LED strip with color sequence - useful for debugging hardware issues
+void testLEDs() {
+  debugLog("LED Test Mode: Starting self-test");
+  
+  // Clear all LEDs
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
   driver.showPixels(NO_WAIT);
+  delay(500);
+  
+  // Test RED
+  debugLog("LED Test: RED");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test GREEN
+  debugLog("LED Test: GREEN");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 255;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test BLUE
+  debugLog("LED Test: BLUE");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 255;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test WHITE
+  debugLog("LED Test: WHITE");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 255;
+    ledData[i].b = 255;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Return to normal state
+  debugLog("LED Test: Complete");
+  if (settings.useStaticColor) {
+    applyStaticColor();
+  } else {
+    // Turn LEDs off
+    for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+      ledData[i].r = 0;
+      ledData[i].g = 0;
+      ledData[i].b = 0;
+    }
+    driver.showPixels(NO_WAIT);
+  }
 }
 
 // Update the OLED display with current status information
@@ -925,6 +1107,65 @@ void saveSettings()
   debugLog("Settings saved to preferences");
 }
 
+// LED Driver Initialization
+// This is a critical fix that ensures proper LED strip initialization
+void initializeLEDDriver() {
+  debugLog("Initializing LED driver with settings: numStrips=" + String(settings.numStrips) + 
+           ", ledsPerStrip=" + String(settings.ledsPerStrip));
+  
+  // Create pin configuration arrays based on settings
+  int activePins[4] = {-1, -1, -1, -1}; // Initialize all pins to -1 (disabled)
+  int activeCount = 0; // Track how many active pins we have
+  
+  // Only add pins that are valid (not -1)
+  for (int i = 0; i < 4; i++) {
+    if (settings.pins[i] >= 0) {
+      activePins[activeCount] = settings.pins[i];
+      activeCount++;
+    }
+  }
+  
+  // Ensure we have at least one valid pin
+  if (activeCount == 0) {
+    debugLog("ERROR: No valid pins configured. Using pin 12 as fallback.");
+    activePins[0] = 12; // Default to pin 12 if no valid pins
+    activeCount = 1;
+  }
+  
+  // Update strips count to match active pin count if necessary
+  if (settings.numStrips > activeCount) {
+    debugLog("WARNING: More strips configured than pins available. Limiting to " + String(activeCount));
+    settings.numStrips = activeCount;
+  }
+  
+  // Initialize driver with the active pins
+  debugLog("Configuring " + String(activeCount) + " active pin(s): " + String(activePins[0]) + 
+           (activeCount > 1 ? ", " + String(activePins[1]) : "") +
+           (activeCount > 2 ? ", " + String(activePins[2]) : "") + 
+           (activeCount > 3 ? ", " + String(activePins[3]) : ""));
+  
+  // Instead of resetLedsState (which doesn't exist), we'll manually clear things
+  // Clear existing LED data
+  memset(ledData, 0, sizeof(ledData));
+  
+  // Small delay before initialization
+  delay(10);
+  
+  // Initialize with active pins
+  driver.initled(NULL, activePins, activeCount, settings.ledsPerStrip);
+  
+  // Set global brightness
+  driver.setBrightness(settings.brightness);
+  
+  // Apply initial clear - essential for proper initialization
+  // Clear all LEDs to black
+  memset(ledData, 0, sizeof(ledData));
+  driver.showPixels(WAIT); // Use WAIT for initialization to ensure it completes
+  delay(50); // Brief delay to ensure the clear takes effect
+  
+  debugLog("LED driver initialization complete");
+}
+
 // ====== SETUP ======
 void setup()
 {
@@ -990,6 +1231,18 @@ void setup()
   server.on("/", handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.on("/debug", handleDebugLog);
+  // Add LED test endpoint for hardware validation
+  server.on("/test", HTTP_GET, []() {
+    testLEDs();
+    server.send(200, "text/plain", "LED test completed - check all colors (RED, GREEN, BLUE, WHITE) displayed properly");
+  });
+  
+  // Add a direct test endpoint for more detailed diagnostics
+  server.on("/directtest", HTTP_GET, []() {
+    testDirectLEDControl();
+    server.send(200, "text/plain", "Direct LED test completed - check for any visible output from various test methods");
+  });
+  
   server.begin();
 
   // Display connection status on OLED
@@ -1041,16 +1294,11 @@ void setup()
     display.display();
   }
 
-  // Initialize LED driver with correct parameters for a single strip on pin 12
-  driver.setBrightness(settings.brightness);
-
-  // Make sure we're only passing the active pins
-  int activePins[1] = {settings.pins[0]}; // Only use pin 12
-  driver.initled(NULL, activePins, 1, settings.ledsPerStrip);
-
-  // Debug output to show what pin we're using
-  debugLog("LED strip initialized on pin: " + String(settings.pins[0]) +
-           " with " + String(settings.ledsPerStrip) + " LEDs");
+  // Initialize LED driver with the new improved method
+  initializeLEDDriver();
+  
+  // Run the direct LED test to diagnose connectivity issues
+  testDirectLEDControl();
 
   // Only initialize ArtNet if it's enabled
   if (settings.useArtnet)

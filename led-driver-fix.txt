@@ -1,0 +1,277 @@
+// ESP32 I2SClockless WS2812 LED Fix
+// This implementation addresses the issues with LEDs not working in static/cycle mode
+
+/**
+ * Fix 1: Proper LED Driver Initialization
+ * 
+ * Replace the current driver initialization in setup() with this implementation
+ * that matches the working approach from the original code.
+ */
+void initializeLEDDriver() {
+  // Clear the buffer to start with all LEDs off
+  // This ensures no random data is displayed
+  memset(ledData, 0, sizeof(ledData));
+  
+  // Set brightness from settings
+  driver.setBrightness(settings.brightness);
+  
+  // Create pin arrays like in the original working code
+  int onePin[1] = { settings.pins[0] };     // Single pin (default)
+  int twoPin[2] = { settings.pins[0], settings.pins[1] };
+  int threePin[3] = { settings.pins[0], settings.pins[1], settings.pins[2] };
+  int fourPin[4] = { settings.pins[0], settings.pins[1], settings.pins[2], settings.pins[3] };
+  
+  // Initialize based on configured number of strips
+  if (settings.numStrips == 2) {
+    driver.initled(NULL, twoPin, settings.numStrips, settings.ledsPerStrip);
+    debugLog("Initializing 2 LED strips on pins: " + String(settings.pins[0]) + "," + String(settings.pins[1]));
+  } else if (settings.numStrips == 3) {
+    driver.initled(NULL, threePin, settings.numStrips, settings.ledsPerStrip);
+    debugLog("Initializing 3 LED strips on pins: " + String(settings.pins[0]) + "," + 
+             String(settings.pins[1]) + "," + String(settings.pins[2]));
+  } else if (settings.numStrips == 4) {
+    driver.initled(NULL, fourPin, settings.numStrips, settings.ledsPerStrip);
+    debugLog("Initializing 4 LED strips on pins: " + String(settings.pins[0]) + "," +
+             String(settings.pins[1]) + "," + String(settings.pins[2]) + "," + String(settings.pins[3]));
+  } else {
+    // Default to single strip/pin if others not specified
+    driver.initled(NULL, onePin, 1, settings.ledsPerStrip);
+    debugLog("Initializing 1 LED strip on pin: " + String(settings.pins[0]));
+  }
+  
+  // Apply initial clear - essential for proper initialization
+  driver.showPixels(NO_WAIT);
+  delay(50); // Brief delay to ensure the clear takes effect
+  
+  debugLog("LED driver initialized with " + String(settings.ledsPerStrip) + " LEDs per strip");
+}
+
+/**
+ * Fix 2: Improved Static Color Application
+ * 
+ * Replace the current applyStaticColor() function with this improved version
+ * that properly formats the data for the I2SClocklessLedDriver.
+ */
+void applyStaticColor() {
+  if (!settings.useStaticColor) return;
+  
+  debugLog("Applying static color RGB: " + String(settings.staticColor.r) + "," +
+           String(settings.staticColor.g) + "," + String(settings.staticColor.b));
+  
+  // Clear the buffer first
+  memset(ledData, 0, sizeof(ledData));
+  
+  // Calculate total number of LEDs across all strips
+  int totalLEDs = settings.numStrips * settings.ledsPerStrip;
+  
+  // Apply the static color to all LEDs
+  for (int i = 0; i < totalLEDs; i++) {
+    ledData[i].r = settings.staticColor.r;
+    ledData[i].g = settings.staticColor.g;
+    ledData[i].b = settings.staticColor.b;
+  }
+  
+  // Force update the LEDs
+  driver.showPixels(NO_WAIT);
+  
+  debugLog("Static color applied to " + String(totalLEDs) + " LEDs");
+}
+
+/**
+ * Fix 3: Improved LED Update Function
+ * 
+ * Replace the updateLEDsBasedOnMode() function with this optimized version
+ * that properly handles all modes and ensures LED updates.
+ */
+void updateLEDsBasedOnMode() {
+  unsigned long currentMillis = millis();
+
+  // Skip updates for animations if not enough time has passed
+  if (!settings.useStaticColor && 
+      !settings.useArtnet && 
+      currentMillis - lastColorUpdate < (101 - settings.cycleSpeed)) {
+    return;
+  }
+
+  lastColorUpdate = currentMillis;
+  
+  // ArtNet mode is handled separately in the callback
+  if (settings.useArtnet) {
+    return;
+  }
+
+  // Static color mode has priority
+  if (settings.useStaticColor) {
+    applyStaticColor();
+  } 
+  // Color cycle mode
+  else if (settings.useColorCycle) {
+    switch (settings.colorMode) {
+      case COLOR_MODE_RAINBOW:
+        rainbowCycle();
+        break;
+      case COLOR_MODE_PULSE:
+        pulseEffect();
+        break;
+      case COLOR_MODE_FIRE:
+        fireEffect();
+        break;
+      default:
+        rainbowCycle();
+        break;
+    }
+    
+    // Critical: Force update LEDs
+    driver.showPixels(NO_WAIT);
+  }
+  // Fallback to static color if nothing else is active
+  else {
+    applyStaticColor();
+  }
+}
+
+/**
+ * Fix 4: Setup Modification
+ * 
+ * Replace the LED initialization part in setup() with this code
+ */
+void setup() {
+  // Existing setup code...
+  
+  // Initialize LED driver with new function
+  initializeLEDDriver();
+  
+  // Set initial LED state based on settings
+  if (!settings.useArtnet) {
+    if (settings.useStaticColor) {
+      debugLog("Starting in static color mode");
+      applyStaticColor();
+    } else if (settings.useColorCycle) {
+      debugLog("Starting in color cycle mode: " + String(settings.colorMode));
+      // First update will be handled in the loop
+    }
+  } else {
+    debugLog("Starting in ArtNet mode");
+  }
+  
+  // Rest of setup code...
+}
+
+/**
+ * Fix 5: Modified ArtNet Callback
+ * 
+ * Update the artnetCallback function to ensure proper data handling
+ */
+void artnetCallback(void *param) {
+  subArtnet *sub = (subArtnet *)param;
+
+  // Get ArtNet data
+  uint8_t *data = sub->getData();
+  int dataLength = sub->_nb_data;
+
+  debugLog("ArtNet data received: " + String(dataLength) + " bytes");
+
+  // Save DMX data for potential use in other modes
+  if (dataLength > UNIVERSE_SIZE) {
+    dataLength = UNIVERSE_SIZE;
+  }
+  memcpy(dmxData, data, dataLength);
+
+  // Only process data if in ArtNet mode
+  if (settings.useArtnet) {
+    // Map DMX data to LED array
+    for (int i = 0; i < dataLength; i += NB_CHANNEL_PER_LED) {
+      int ledIndex = i / NB_CHANNEL_PER_LED;
+      if (ledIndex < MAX_STRIPS * NUM_LEDS_PER_STRIP) {
+        ledData[ledIndex].r = data[i];
+        ledData[ledIndex].g = data[i + 1];
+        ledData[ledIndex].b = data[i + 2];
+      }
+    }
+
+    // Update LEDs with new data
+    driver.showPixels(NO_WAIT);
+
+    // Update tracking variables
+    lastPacketTime = millis();
+    packetsReceived++;
+  }
+}
+
+/**
+ * Fix 6: Debug and Test Mode Function
+ * 
+ * Add this function to help diagnose LED issues
+ */
+void testLEDs() {
+  debugLog("LED Test Mode: Starting self-test");
+  
+  // Clear all LEDs
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(500);
+  
+  // Test RED
+  debugLog("LED Test: RED");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 0;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test GREEN
+  debugLog("LED Test: GREEN");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 255;
+    ledData[i].b = 0;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test BLUE
+  debugLog("LED Test: BLUE");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 0;
+    ledData[i].g = 0;
+    ledData[i].b = 255;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Test WHITE
+  debugLog("LED Test: WHITE");
+  for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+    ledData[i].r = 255;
+    ledData[i].g = 255;
+    ledData[i].b = 255;
+  }
+  driver.showPixels(NO_WAIT);
+  delay(1000);
+  
+  // Return to normal state
+  debugLog("LED Test: Complete");
+  if (settings.useStaticColor) {
+    applyStaticColor();
+  } else {
+    // Turn LEDs off
+    for (int i = 0; i < settings.numStrips * settings.ledsPerStrip; i++) {
+      ledData[i].r = 0;
+      ledData[i].g = 0;
+      ledData[i].b = 0;
+    }
+    driver.showPixels(NO_WAIT);
+  }
+}
+
+// Add a menu option or command to trigger the test:
+// server.on("/test", HTTP_GET, []() {
+//   testLEDs();
+//   server.send(200, "text/plain", "LED test initiated");
+// });
