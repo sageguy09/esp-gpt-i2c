@@ -365,16 +365,17 @@ void handleConfig()
       settings.password = server.arg("pass");
     if (server.hasArg("nodeName"))
       settings.nodeName = server.arg("nodeName");
-      
+
     // Check if we need to restart network functionality
     bool wifiConfigChanged = false;
     if (server.hasArg("ssid") && settings.ssid != server.arg("ssid"))
       wifiConfigChanged = true;
     if (server.hasArg("pass") && settings.password != server.arg("pass"))
       wifiConfigChanged = true;
-      
+
     // If network config changed, we'll need to restart network services
-    if (wifiConfigChanged && (settings.useArtnet || settings.useWiFi)) {
+    if (wifiConfigChanged && (settings.useArtnet || settings.useWiFi))
+    {
       debugLog("WiFi configuration changed - preparing to restart network services");
       // Save the flag for network restart
       preferences.begin("led-settings", false);
@@ -423,17 +424,21 @@ void handleConfig()
 
   // Check if hardware-affecting settings have changed
   bool needsRestart = false;
-  
+
   // Hardware configuration changes may require a restart
-  if (server.hasArg("leds") || server.hasArg("strips") || 
-      server.hasArg("pin0") || server.hasArg("pin1") || 
-      server.hasArg("pin2") || server.hasArg("pin3")) {
-    
+  if (server.hasArg("leds") || server.hasArg("strips") ||
+      server.hasArg("pin0") || server.hasArg("pin1") ||
+      server.hasArg("pin2") || server.hasArg("pin3"))
+  {
+
     // Attempt to reinitialize LED driver first
-    try {
+    try
+    {
       debugLog("Hardware configuration changed - reinitializing LED driver");
       initializeLEDDriver();
-    } catch (...) {
+    }
+    catch (...)
+    {
       // If reinitialization fails, we'll need a full restart
       needsRestart = true;
     }
@@ -449,18 +454,21 @@ void handleConfig()
   }
 
   // If we need a restart, inform the user and schedule it
-  if (needsRestart) {
+  if (needsRestart)
+  {
     // First send response to browser
     server.sendHeader("Location", "/", true);
     server.send(302, "text/plain", "Settings Updated - Device Restarting");
-    
+
     // Allow time for the response to be sent
     delay(1000);
-    
+
     // Then restart the device
     ESP.restart();
     return;
-  } else {
+  }
+  else
+  {
     // Normal operation - just redirect back to root page
     server.sendHeader("Location", "/", true);
     server.send(302, "text/plain", "Settings Updated");
@@ -1417,20 +1425,26 @@ void setup()
   server.on("/", handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.on("/debug", handleDebugLog);
-  
+
   // IMPORTANT: Start web server before any network operations
-  try {
+  try
+  {
     server.begin();
     debugLog("Web server started");
-  } catch (...) {
+  }
+  catch (...)
+  {
     debugLog("Web server start failed");
   }
 
   // CRITICAL: Network operations in separate section with strong error handling
-  if ((settings.useArtnet || settings.useWiFi) && !networkInitFailed) {
+  if ((settings.useArtnet || settings.useWiFi) && !networkInitFailed)
+  {
     // Move network operations to a separate function to isolate errors
     initializeNetworkWithProtection();
-  } else {
+  }
+  else
+  {
     // Skip all network operations
     debugLog("Network operations skipped - using standalone mode");
   }
@@ -1439,56 +1453,70 @@ void setup()
 }
 
 // New separate function to isolate network operations
-void initializeNetworkWithProtection() {
+void initializeNetworkWithProtection()
+{
   debugLog("Starting protected network initialization");
-  
+
   // Critical section in try-catch to prevent boot loops
-  try {
+  try
+  {
     // Set a timeout in case anything hangs
     unsigned long networkStartTime = millis();
-    
+
     // First, try basic WiFi mode configuration which might trigger the assertion
     WiFi.persistent(false);
     WiFi.disconnect(true);
     delay(200);
-    
+
     // This is where the assertion often happens - protected with timeout
     bool modeSet = false;
     debugLog("Setting WiFi mode...");
     WiFi.mode(WIFI_STA);
     delay(500);
-    
+
     // Only proceed if mode was set successfully
     debugLog("Attempting to connect to WiFi: " + settings.ssid);
     WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
-    
+
     // Very brief non-blocking wait
     unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000)
+    {
       delay(100);
       yield(); // Keep watchdog happy
     }
-    
-    if (WiFi.status() == WL_CONNECTED) {
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
       debugLog("WiFi connected successfully");
-      
+
       // Only proceed with ArtNet if WiFi is working
-      if (settings.useArtnet) {
-        try {
+      if (settings.useArtnet)
+      {
+        try
+        {
           initializeArtNet();
-        } catch (...) {
+        }
+        catch (...)
+        {
           debugLog("ArtNet initialization failed, falling back to standalone mode");
           settings.useArtnet = false;
         }
       }
-    } else {
+    }
+    else
+    {
       throw std::runtime_error("WiFi connection timeout");
     }
-  } catch (const std::exception& e) {
+  }
+  catch (const std::exception &e)
+  {
     // Catch specific exceptions if possible
     debugLog("Network error: " + String(e.what()));
     disableAllNetworkOperations();
-  } catch (...) {
+  }
+  catch (...)
+  {
     // Catch any other errors
     debugLog("Unknown network error occurred");
     disableAllNetworkOperations();
@@ -1496,20 +1524,24 @@ void initializeNetworkWithProtection() {
 }
 
 // Separate ArtNet initialization to further isolate potential failures
-void initializeArtNet() {
+void initializeArtNet()
+{
   IPAddress localIP = WiFi.localIP();
   debugLog("Initializing ArtNet on IP: " + localIP.toString());
-  
+
   bool artnetStarted = artnet.listen(localIP, 6454);
-  if (artnetStarted) {
+  if (artnetStarted)
+  {
     artnet.setFrameCallback(frameCallbackWrapper);
     artnet.addSubArtnet(settings.startUniverse,
-                      settings.numStrips * settings.ledsPerStrip * NB_CHANNEL_PER_LED,
-                      UNIVERSE_SIZE,
-                      &artnetCallback);
+                        settings.numStrips * settings.ledsPerStrip * NB_CHANNEL_PER_LED,
+                        UNIVERSE_SIZE,
+                        &artnetCallback);
     artnet.setNodeName(settings.nodeName);
     debugLog("ArtNet initialized successfully");
-  } else {
+  }
+  else
+  {
     debugLog("ArtNet failed to listen on IP");
     throw std::runtime_error("ArtNet initialization failed");
   }
