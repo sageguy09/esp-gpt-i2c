@@ -1338,15 +1338,59 @@ void setup()
   delay(100); // Short delay to stabilize serial
   debugLog("ESP32 ArtNet LED Controller Starting");
 
-  // CRITICAL: Completely disable network functionality first
-  // This is essential to prevent the tcpip_send_msg assertion failure
-  WiFi.mode(WIFI_OFF);
-  delay(500); // Longer delay to ensure WiFi is fully off
-
   // Load settings from preferences first
   loadSettings();
 
-  // Initialize LED driver with minimal configuration
+  // Initialize boot counter for safe mode detection
+  checkBootLoopProtection();
+
+  // CRITICAL: Completely disable network functionality if in safe mode or previously failed
+  // This is essential to prevent the tcpip_send_msg assertion failure
+  if (networkInitFailed || inSafeMode)
+  {
+    WiFi.mode(WIFI_OFF);
+    delay(500); // Longer delay to ensure WiFi is fully off
+    debugLog("Network disabled due to previous failures or safe mode");
+  }
+  // Otherwise try network initialization FIRST (before other peripherals)
+  else if (settings.useArtnet || settings.useWiFi)
+  {
+    // Move network operations to a separate function to isolate errors
+    initializeNetworkWithProtection();
+  }
+  else
+  {
+    // Skip all network operations
+    WiFi.mode(WIFI_OFF);
+    delay(500); // Ensure WiFi is fully off
+    debugLog("Network operations skipped - using standalone mode");
+  }
+
+  // Configure UART after network but before LED initialization
+  pinMode(UART_RX_PIN, INPUT);
+  pinMode(UART_TX_PIN, OUTPUT);
+  Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  // Initialize UART bridge with error handling
+  try
+  {
+    bool uartOK = uartBridge.initializeCommunication();
+    if (uartOK)
+    {
+      debugLog("UART Bridge initialized successfully");
+      uartBridge.setCommandCallback(handleUARTCommand);
+    }
+    else
+    {
+      debugLog("UART Bridge initialization failed, continuing without UART");
+    }
+  }
+  catch (...)
+  {
+    debugLog("UART exception occurred, continuing without UART");
+  }
+
+  // Initialize LED driver AFTER network and UART
   try
   {
     debugLog("Initializing LED driver with basic setup");
@@ -1372,31 +1416,7 @@ void setup()
     ledHardwareFailed = true; // Mark LED hardware as failed
   }
 
-  // Configure UART after LED initialization
-  pinMode(UART_RX_PIN, INPUT);
-  pinMode(UART_TX_PIN, OUTPUT);
-  Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-
-  // Initialize UART bridge with error handling
-  try
-  {
-    bool uartOK = uartBridge.initializeCommunication();
-    if (uartOK)
-    {
-      debugLog("UART Bridge initialized successfully");
-      uartBridge.setCommandCallback(handleUARTCommand);
-    }
-    else
-    {
-      debugLog("UART Bridge initialization failed, continuing without UART");
-    }
-  }
-  catch (...)
-  {
-    debugLog("UART exception occurred, continuing without UART");
-  }
-
-  // Initialize display with error handling
+  // Initialize display LAST since it's least critical
   try
   {
     bool displayOK = display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
@@ -1426,7 +1446,7 @@ void setup()
   server.on("/config", HTTP_POST, handleConfig);
   server.on("/debug", handleDebugLog);
 
-  // IMPORTANT: Start web server before any network operations
+  // IMPORTANT: Start web server after all other initializations
   try
   {
     server.begin();
@@ -1437,22 +1457,64 @@ void setup()
     debugLog("Web server start failed");
   }
 
-  // CRITICAL: Network operations in separate section with strong error handling
-  if ((settings.useArtnet || settings.useWiFi) && !networkInitFailed)
-  {
-    // Move network operations to a separate function to isolate errors
-    initializeNetworkWithProtection();
-  }
-  else
-  {
-    // Skip all network operations
-    debugLog("Network operations skipped - using standalone mode");
-  }
-
+  // Mark successful boot
+  updateBootCounter(true);
   debugLog("Setup complete - entering main loop");
 }
 
-// New separate function to isolate network operations
+// Add boot loop protection with counter
+// These variables need to be added at global scope
+bool inSafeMode = false;
+int bootCount = 0;
+unsigned long lastBootTime = 0;
+
+void checkBootLoopProtection()
+{
+  preferences.begin("led-settings", false);
+
+  // Get boot count and last boot time
+  bootCount = preferences.getInt("bootCount", 0);
+  lastBootTime = preferences.getLong("lastBootTime", 0);
+  unsigned long currentTime = millis();
+
+  // Check for rapid reboots indicating a boot loop
+  if (bootCount > 3 && (currentTime - lastBootTime < 300000))
+  { // 5 minutes
+    // Enable safe mode if too many boots in short time
+    inSafeMode = true;
+    debugLog("SAFE MODE ENABLED: Multiple boot failures detected");
+
+    // Use minimal configuration in safe mode
+    settings.useArtnet = false;
+    settings.useWiFi = false;
+    settings.useColorCycle = false;
+    settings.useStaticColor = true;
+    settings.staticColor = {255, 0, 0}; // Red = safe mode
+    settings.numStrips = 1;
+    settings.ledsPerStrip = 8; // Minimal LED count
+    settings.brightness = 64;  // Reduced brightness
+  }
+
+  // Increment boot counter and save time
+  bootCount++;
+  preferences.putInt("bootCount", bootCount);
+  preferences.putLong("lastBootTime", currentTime);
+  preferences.end();
+}
+
+void updateBootCounter(bool success)
+{
+  preferences.begin("led-settings", false);
+  if (success)
+  {
+    // Reset boot counter after successful boot
+    preferences.putInt("bootCount", 0);
+    debugLog("Boot successful - counter reset");
+  }
+  preferences.end();
+}
+
+// Improved network initialization with better timeouts
 void initializeNetworkWithProtection()
 {
   debugLog("Starting protected network initialization");
@@ -1469,32 +1531,41 @@ void initializeNetworkWithProtection()
     delay(200);
 
     // This is where the assertion often happens - protected with timeout
-    bool modeSet = false;
     debugLog("Setting WiFi mode...");
     WiFi.mode(WIFI_STA);
-    delay(500);
+    delay(500); // Critical delay for stability
 
-    // Only proceed if mode was set successfully
+    // Only proceed if we haven't crashed by this point
     debugLog("Attempting to connect to WiFi: " + settings.ssid);
     WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
 
-    // Very brief non-blocking wait
+    // Non-blocking wait with proper timeout
     unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000)
+    int dotCount = 0;
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000)
     {
       delay(100);
       yield(); // Keep watchdog happy
+
+      // Visual feedback but don't spam the log
+      if (millis() - startAttempt > dotCount * 1000)
+      {
+        Serial.print(".");
+        dotCount++;
+      }
     }
 
     if (WiFi.status() == WL_CONNECTED)
     {
-      debugLog("WiFi connected successfully");
+      debugLog("WiFi connected successfully to: " + settings.ssid);
+      debugLog("IP address: " + WiFi.localIP().toString());
 
       // Only proceed with ArtNet if WiFi is working
       if (settings.useArtnet)
       {
         try
         {
+          delay(500); // Additional stability delay before ArtNet init
           initializeArtNet();
         }
         catch (...)
@@ -1506,6 +1577,7 @@ void initializeNetworkWithProtection()
     }
     else
     {
+      debugLog("WiFi connection failed after timeout");
       throw std::runtime_error("WiFi connection timeout");
     }
   }
