@@ -401,6 +401,9 @@ void handleConfig()
   // Save settings to preferences
   saveSettings();
 
+  // Apply the current mode settings
+  applyModeSettings();
+
   // Normal operation - just redirect back to root page
   server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "Settings Updated");
@@ -596,6 +599,106 @@ void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
     debugLog("UART: Unknown command: 0x" + String(cmd, HEX));
     break;
   }
+}
+
+// Mode management functions
+void stopAllModes() {
+  // Clear the LEDs first
+  fill_solid(leds, fullSettings.ledsPerStrip, CRGB::Black);
+  FastLED.show();
+  
+  // Stop ArtNet if it's running
+  if (state.artnetRunning) {
+    artnet.end();
+    state.artnetRunning = false;
+    debugLog("ArtNet mode stopped");
+  }
+  
+  // Reset state variables for other modes
+  // This ensures any animation variables are reset
+  debugLog("All LED modes stopped");
+}
+
+void startArtNetMode() {
+  // Make sure other modes are stopped first
+  stopAllModes();
+  
+  // Initialize ArtNet if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    setupArtNet();
+    debugLog("ArtNet mode started");
+  } else {
+    debugLog("ERROR: Cannot start ArtNet mode - WiFi not connected");
+    // Fall back to static color mode
+    fullSettings.useArtnet = false;
+    fullSettings.useStaticColor = true;
+    saveSettings();
+    startStaticColorMode();
+  }
+}
+
+void startStaticColorMode() {
+  // Make sure other modes are stopped first
+  stopAllModes();
+  
+  // Set the static color
+  CRGB staticColor = CRGB(fullSettings.staticColor.r, fullSettings.staticColor.g, fullSettings.staticColor.b);
+  fill_solid(leds, fullSettings.ledsPerStrip, staticColor);
+  FastLED.show();
+  
+  debugLog("Static color mode started: RGB(" + 
+           String(fullSettings.staticColor.r) + "," + 
+           String(fullSettings.staticColor.g) + "," + 
+           String(fullSettings.staticColor.b) + ")");
+}
+
+void startColorCycleMode() {
+  // Make sure other modes are stopped first
+  stopAllModes();
+  
+  // No need to initialize anything specific here
+  // The loop() function will handle the animations
+  debugLog("Color cycle mode started with effect: " + String(fullSettings.colorMode));
+}
+
+// Apply the current mode settings
+void applyModeSettings() {
+  // Check which mode should be active and start it
+  if (fullSettings.useArtnet) {
+    startArtNetMode();
+  } else if (fullSettings.useStaticColor) {
+    startStaticColorMode();
+  } else if (fullSettings.useColorCycle) {
+    startColorCycleMode();
+  } else {
+    // If no mode is active, turn off LEDs
+    stopAllModes();
+  }
+}
+
+// Helper function to setup ArtNet
+void setupArtNet() {
+  // Reset state if already running
+  if (state.artnetRunning) {
+    artnet.end();
+    state.artnetRunning = false;
+  }
+  
+  debugLog("Initializing ArtNet...");
+  
+  // Configure ArtNet with universe and DMX callback
+  artnet.begin();
+  artnet.setArtDmxCallback(onDmxFrame);
+  artnet.setNodeName(settings.nodeName);
+  
+  // Set universe
+  settings.artnetUniverse = fullSettings.startUniverse;
+  
+  // Mark as running
+  state.artnetRunning = true;
+  state.lastArtnetPacket = 0;
+  
+  debugLog("ArtNet initialized, listening on universe " + String(settings.artnetUniverse));
 }
 
 // Create a minimal setup function that delegates to the common code
