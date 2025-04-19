@@ -1,0 +1,155 @@
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h> // NeoPixel library for LED control
+#include <WiFi.h>              // WiFi library
+#include <WebServer.h>         // Web server library for handling HTTP requests
+
+// Pin configuration
+#define LED_PIN 5    // Pin connected to the NeoPixel data input
+#define NUM_PIXELS 1 // Number of pixels in the strip
+
+// Define the NeoPixel strip object
+Adafruit_NeoPixel strip(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// WiFi credentials (replace with your credentials)
+const char *ssid = "Sage1";
+const char *password = "J@sper123";
+
+// WiFi connection timeout (in milliseconds)
+const unsigned long WIFI_TIMEOUT = 20000; // 20 seconds
+
+// Create a WebServer object on port 80
+WebServer server(80); // Standard WebServer library
+
+// HTML content for the index page
+const char *index_html = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>ESP32 NeoPixel Web Server</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
+    h1 { color: #0066cc; }
+    .status { padding: 10px; background-color: #f0f0f0; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Web Server</h1>
+  <div class="status">
+    <p>LED strip is working!</p>
+    <p>Color: <span style="color: red;">Red</span></p>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// Handler for the root path
+void handleRoot()
+{
+  server.send(200, "text/html", index_html);
+}
+
+// Handler for 404 Not Found
+void handleNotFound()
+{
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++)
+  {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
+}
+
+void setup()
+{
+  // Start serial communication for debugging
+  Serial.begin(115200);
+  delay(1000); // Give the serial monitor time to connect
+
+  Serial.println("ESP32 NeoPixel Web Server Starting...");
+
+  // Initialize the LED strip first
+  strip.begin();
+  strip.clear(); // Clear any previous settings
+  strip.show();  // Initialize all pixels to 'off'
+
+  Serial.println("NeoPixel strip initialized");
+
+  // Set a static color (e.g., Red)
+  strip.setPixelColor(0, strip.Color(255, 0, 0)); // Red color on the first pixel
+  strip.show();                                   // Update the strip with the new color
+  Serial.println("LED set to red");
+
+  // Handle errors and unexpected conditions
+  if (strip.numPixels() != NUM_PIXELS)
+  {
+    Serial.println("Error: LED strip pixel count mismatch.");
+    // Continue anyway, but log the error
+  }
+
+  // Connect to Wi-Fi with timeout
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  unsigned long startAttemptTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttemptTime < WIFI_TIMEOUT)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("\nFailed to connect to WiFi. Operating in standalone mode.");
+  }
+  else
+  {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Set up server routes
+    server.on("/", HTTP_GET, handleRoot);
+    server.onNotFound(handleNotFound);
+
+    // Start the server
+    server.begin();
+    Serial.println("Web server started");
+  }
+
+  Serial.println("Setup complete");
+}
+
+void loop()
+{
+  // The web server will automatically handle incoming requests
+  server.handleClient(); // This is where the server processes incoming requests
+
+  // If WiFi connection is lost, you could add reconnection logic here
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    static unsigned long lastReconnectAttempt = 0;
+    unsigned long currentMillis = millis();
+
+    // Try to reconnect every 30 seconds
+    if (currentMillis - lastReconnectAttempt > 30000)
+    {
+      lastReconnectAttempt = currentMillis;
+      Serial.println("Attempting to reconnect to WiFi...");
+      WiFi.reconnect();
+    }
+  }
+
+  // Small delay to prevent watchdog timer issues
+  delay(10);
+}

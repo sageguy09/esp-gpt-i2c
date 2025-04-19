@@ -10,6 +10,7 @@
 - [x] UART Communication Bridge
 - [x] LED Driver Fix - LEDs now lighting up
 - [x] Network Stability Fixes
+- [x] TCP/IP Stack Initialization Fix - April 2025
 - [ ] PyPortal Integration
 - [ ] Advanced Error Handling
 
@@ -89,14 +90,29 @@ This error occurs after successful LED initialization and static color applicati
    - Added extensive try/catch blocks around network operations
    - Created separate FreeRTOS task for network initialization to isolate potential crashes
    - Added persistent crash state storage to prevent boot loops
+   - **NEW (April 2025)**: Implemented proper ESP-IDF TCP/IP stack initialization sequence
 
-2. **Graceful Degradation**:
+2. **TCP/IP Stack Initialization Sequence**:
+   - Fixed the critical assertion failure by properly initializing components in the correct order
+   - Explicitly called `esp_netif_init()` before any other network operations
+   - Ensured event loop is created with `esp_event_loop_create_default()` before WiFi initialization
+   - Added proper error handling for each initialization step
+   - Implemented the sequence in both main setup and the isolated network task
+
+3. **FreeRTOS Task Isolation**:
+   - Moved network initialization to a dedicated task running on a separate core
+   - Prevented network initialization failures from affecting LED operations
+   - Implemented proper task cleanup and resource management
+   - Added task status reporting through debug logs
+
+4. **Graceful Degradation**:
    - System now works even if network components fail
    - Falls back to standalone mode when network is unavailable
    - Preserves LED functionality regardless of network status
    - Provides user feedback about disabled network functionality
+   - **NEW (April 2025)**: Added visual indicator (red LED color) when in safe mode
 
-3. **Error Recovery**:
+5. **Error Recovery**:
    - Added strategic yield() calls to keep watchdog timer happy
    - Wrapped all critical sections in try/catch blocks
    - Added persistent failure tracking across reboots
@@ -109,6 +125,41 @@ The fix has been successfully implemented and tested. The ESP32 now:
 3. Persists network failure state across reboots to prevent recurring crashes
 4. Continues to function in standalone mode even when network functionality fails
 5. Provides clear feedback to users about the network state
+
+### Network Initialization Details
+The correct TCP/IP stack initialization sequence is critical to prevent lwIP assertion failures:
+
+```cpp
+// 1. Initialize TCP/IP stack components first
+esp_err_t err = esp_netif_init();
+if (err != ESP_OK) {
+  debugLog("TCP/IP stack initialization failed");
+  // Handle error
+}
+
+// 2. Create the default event loop
+err = esp_event_loop_create_default();
+if (err != ESP_OK) {
+  debugLog("Event loop creation failed");
+  // Handle error
+}
+
+// 3. Initialize and configure WiFi
+WiFi.persistent(false);
+WiFi.disconnect(true);
+delay(200);
+WiFi.mode(WIFI_STA);
+delay(500); // Critical delay for stability
+
+// 4. Connect to WiFi with proper error handling
+WiFi.begin(ssid, password);
+// Add timeout and error handling
+
+// 5. Initialize ArtNet only after WiFi is connected
+// with proper error handling
+```
+
+This sequence ensures that the TCP/IP stack's message box (mbox) is properly initialized before any attempts to use it, preventing the "Invalid mbox" assertion failure.
 
 ## Key Component Interactions
 

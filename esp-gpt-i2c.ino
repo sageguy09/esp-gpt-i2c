@@ -77,9 +77,15 @@ rgb24 ledData[MAX_STRIPS * NUM_LEDS_PER_STRIP]; // Fixed error with NUM_LEDS_PER
 bool sendFrame = false;
 
 // Anti-boot loop protection
-// This is a global variable to track critical errors and prevent retries
+// These are global variables to track critical errors and prevent retries
 bool networkInitFailed = false;
 bool ledHardwareFailed = false;
+bool inSafeMode = false;        // Global variable for safe mode
+int bootCount = 0;              // Boot counter for loop detection
+unsigned long lastBootTime = 0; // Time of last boot attempt
+
+// Global task handle for network operations
+TaskHandle_t networkTaskHandle = NULL;
 
 // Runtime state + settings struct
 struct Settings
@@ -1344,29 +1350,66 @@ void setup()
   // Initialize boot counter for safe mode detection
   checkBootLoopProtection();
 
-  // CRITICAL: Completely disable network functionality if in safe mode or previously failed
-  // This is essential to prevent the tcpip_send_msg assertion failure
-  if (networkInitFailed || inSafeMode)
+  // CRITICAL: Initialize TCP/IP components before anything else
+  if (!networkInitFailed && !inSafeMode && (settings.useArtnet || settings.useWiFi))
   {
-    WiFi.mode(WIFI_OFF);
-    delay(500); // Longer delay to ensure WiFi is fully off
-    debugLog("Network disabled due to previous failures or safe mode");
-  }
-  // Otherwise try network initialization FIRST (before other peripherals)
-  else if (settings.useArtnet || settings.useWiFi)
-  {
-    // Move network operations to a separate function to isolate errors
-    initializeNetworkWithProtection();
+    // Initialize essential network components that might cause assertions
+    // This must happen BEFORE any other networking but AFTER preferences are loaded
+    debugLog("Initializing core TCP/IP components...");
+
+    // Try to initialize in the main thread first to ensure proper order
+    try
+    {
+      esp_err_t err = esp_netif_init();
+      if (err != ESP_OK)
+      {
+        debugLog("TCP/IP stack initialization failed: " + String(esp_err_to_name(err)));
+        disableAllNetworkOperations();
+      }
+      else
+      {
+        // Create the default event loop
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK)
+        {
+          debugLog("Event loop creation failed: " + String(esp_err_to_name(err)));
+          disableAllNetworkOperations();
+        }
+        else
+        {
+          debugLog("Core TCP/IP components initialized successfully");
+
+          // Only now create a task for the rest of WiFi initialization
+          xTaskCreatePinnedToCore(
+              networkInitTask,    // Task function
+              "NetworkInitTask",  // Task name
+              8192,               // Stack size
+              NULL,               // Task parameter
+              1,                  // Task priority
+              &networkTaskHandle, // Task handle
+              1                   // Core to run the task on (Core 1)
+          );
+
+          // Brief delay to allow task to start
+          delay(100);
+        }
+      }
+    }
+    catch (...)
+    {
+      debugLog("Exception during TCP/IP initialization");
+      disableAllNetworkOperations();
+    }
   }
   else
   {
-    // Skip all network operations
+    // Completely disable WiFi if not needed or if previous failures occurred
     WiFi.mode(WIFI_OFF);
-    delay(500); // Ensure WiFi is fully off
+    delay(100);
     debugLog("Network operations skipped - using standalone mode");
   }
 
-  // Configure UART after network but before LED initialization
+  // Configure UART after network initialization but before LED initialization
   pinMode(UART_RX_PIN, INPUT);
   pinMode(UART_TX_PIN, OUTPUT);
   Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
@@ -1390,7 +1433,7 @@ void setup()
     debugLog("UART exception occurred, continuing without UART");
   }
 
-  // Initialize LED driver AFTER network and UART
+  // Initialize LED driver AFTER network initialization
   try
   {
     debugLog("Initializing LED driver with basic setup");
@@ -1463,11 +1506,7 @@ void setup()
 }
 
 // Add boot loop protection with counter
-// These variables need to be added at global scope
-bool inSafeMode = false;
-int bootCount = 0;
-unsigned long lastBootTime = 0;
-
+// Remove duplicate declarations since they're already defined at the global scope
 void checkBootLoopProtection()
 {
   preferences.begin("led-settings", false);
@@ -1522,10 +1561,27 @@ void initializeNetworkWithProtection()
   // Critical section in try-catch to prevent boot loops
   try
   {
+    // Initialize the TCP/IP stack first - CRITICAL for preventing assertion failures
+    debugLog("Initializing TCP/IP stack components...");
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK)
+    {
+      debugLog("TCP/IP stack initialization failed: " + String(esp_err_to_name(err)));
+      throw std::runtime_error("TCP/IP stack initialization failed");
+    }
+
+    // Create the default event loop - MUST happen before WiFi initialization
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK)
+    {
+      debugLog("Event loop creation failed: " + String(esp_err_to_name(err)));
+      throw std::runtime_error("Event loop creation failed");
+    }
+
     // Set a timeout in case anything hangs
     unsigned long networkStartTime = millis();
 
-    // First, try basic WiFi mode configuration which might trigger the assertion
+    // First, try basic WiFi mode configuration with proper sequence
     WiFi.persistent(false);
     WiFi.disconnect(true);
     delay(200);
@@ -1617,6 +1673,28 @@ void initializeArtNet()
     debugLog("ArtNet failed to listen on IP");
     throw std::runtime_error("ArtNet initialization failed");
   }
+}
+
+// Network initialization task function - isolates network operations in a separate core
+void networkInitTask(void *parameter)
+{
+  debugLog("Network initialization task started on core " + String(xPortGetCoreID()));
+
+  try
+  {
+    // Initialize network with proper protection mechanisms
+    initializeNetworkWithProtection();
+  }
+  catch (...)
+  {
+    debugLog("Network initialization task encountered an error");
+    disableAllNetworkOperations();
+  }
+
+  // Task is complete - delete itself
+  debugLog("Network initialization task complete");
+  networkTaskHandle = NULL;
+  vTaskDelete(NULL);
 }
 
 void loop()
