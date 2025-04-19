@@ -266,7 +266,7 @@ void processArtNetPacket(AsyncUDPPacket packet)
 void updateLEDs(uint8_t *dmxData, uint16_t numChannels)
 {
   // Each LED uses 3 channels (R,G,B)
-  uint16_t numLEDs = min(numChannels / 3, (uint16_t)settings.ledCount);
+  uint16_t numLEDs = (numChannels / 3 < settings.ledCount) ? numChannels / 3 : settings.ledCount;
 
   // Update each LED with RGB values from DMX data
   for (uint16_t i = 0; i < numLEDs; i++)

@@ -526,10 +526,10 @@ void setup()
   // Start with bare minimum initialization
   Serial.begin(115200);
   delay(100);
-  
+
   // Initialize default settings
   initializeDefaultSettings();
-  
+
   debugLog("ESP32 ArtNet LED Controller Starting - Full Version");
 
   // Load any saved settings from preferences
