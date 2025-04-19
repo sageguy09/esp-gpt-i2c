@@ -1,5 +1,5 @@
 // This file is now a simple wrapper that includes the common code
-// The minimal implementation is in esp-gpt-i2c-minimal/esp-gpt-i2c-minimal.ino
+// The main implementation is in esp-gpt-i2c-full/esp-gpt-i2c-full.ino
 
 #include "ESP_GPT_I2C_Common.h"
 
@@ -7,7 +7,7 @@ void setup() {
   // Initialize serial
   Serial.begin(115200);
   delay(100);
-  debugLog("ESP32 ArtNet LED Controller - Minimal Wrapper");
+  debugLog("ESP32 ArtNet LED Controller - Main Wrapper");
   
   // Display message about modular structure
   Serial.println("This is now a modular project with components in:");
