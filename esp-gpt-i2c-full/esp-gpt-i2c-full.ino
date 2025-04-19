@@ -520,6 +520,84 @@ void saveSettings()
   debugLog("Settings saved to preferences");
 }
 
+// UART command handler callback
+void handleUARTCommand(uint8_t cmd, uint8_t *data, uint16_t length)
+{
+  // Process commands based on the command type
+  switch (cmd)
+  {
+    case 0x01: // Status request
+      // Respond with system status info
+      {
+        uint8_t statusPacket[8];
+        statusPacket[0] = WiFi.status() == WL_CONNECTED ? 1 : 0;  // WiFi connected status
+        statusPacket[1] = state.artnetRunning ? 1 : 0;            // ArtNet running status
+        statusPacket[2] = fullSettings.brightness;                 // Current brightness
+        statusPacket[3] = settings.artnetUniverse;                // Current universe
+        
+        // Send system uptime (in seconds) in the last 4 bytes
+        uint32_t uptime = millis() / 1000;
+        statusPacket[4] = (uptime >> 24) & 0xFF;
+        statusPacket[5] = (uptime >> 16) & 0xFF;
+        statusPacket[6] = (uptime >> 8) & 0xFF;
+        statusPacket[7] = uptime & 0xFF;
+        
+        uartBridge.sendCommand(0x81, statusPacket, 8);
+      }
+      break;
+      
+    case 0x02: // Set brightness
+      if (length >= 1)
+      {
+        fullSettings.brightness = data[0];
+        settings.brightness = data[0];
+        FastLED.setBrightness(data[0]);
+        debugLog("UART: Set brightness to " + String(data[0]));
+        
+        // Acknowledge command
+        uint8_t response = data[0];
+        uartBridge.sendCommand(0x82, &response, 1);
+        
+        // Save to preferences
+        saveSettings();
+      }
+      break;
+      
+    case 0x03: // Set static color
+      if (length >= 3)
+      {
+        fullSettings.staticColor.r = data[0];
+        fullSettings.staticColor.g = data[1];
+        fullSettings.staticColor.b = data[2];
+        fullSettings.useStaticColor = true;
+        fullSettings.useColorCycle = false;
+        fullSettings.useArtnet = false;
+        
+        debugLog("UART: Set static color to RGB(" + 
+                String(data[0]) + "," + 
+                String(data[1]) + "," + 
+                String(data[2]) + ")");
+        
+        // Acknowledge command
+        uartBridge.sendCommand(0x83, data, 3);
+        
+        // Save to preferences
+        saveSettings();
+      }
+      break;
+      
+    case 0xFF: // Reset device
+      debugLog("UART: Reset command received");
+      ESP.restart();
+      break;
+      
+    default:
+      // Unknown command
+      debugLog("UART: Unknown command: 0x" + String(cmd, HEX));
+      break;
+  }
+}
+
 // Create a minimal setup function that delegates to the common code
 void setup()
 {
@@ -535,8 +613,74 @@ void setup()
   // Load any saved settings from preferences
   loadSettings();
 
-  // Rest of setup implementation...
-  // This would include LED driver initialization, web server setup, etc.
+  // Initialize network components if network is available
+  if (!networkInitFailed && settings.useWiFi) {
+    // Create synchronization semaphore
+    networkSemaphore = xSemaphoreCreateBinary();
+    if (networkSemaphore == NULL) {
+      debugLog("ERROR: Failed to create network semaphore");
+    }
+
+    // Create network task on Core 1
+    debugLog("Creating network initialization task on Core 1");
+    xTaskCreatePinnedToCore(
+      networkInitTask,     // Task function
+      "NetworkInitTask",   // Task name
+      16384,               // Stack size (bytes)
+      NULL,                // Task parameter
+      5,                   // Task priority
+      &networkTaskHandle,  // Task handle
+      1                    // Core to run the task on (Core 1)
+    );
+
+    // Wait for network initialization to complete
+    if (networkSemaphore != NULL) {
+      if (xSemaphoreTake(networkSemaphore, pdMS_TO_TICKS(10000)) == pdTRUE) {
+        debugLog("Network initialization completed");
+      } else {
+        debugLog("Network initialization timed out");
+      }
+    }
+  } else {
+    debugLog("Network disabled - skipping initialization");
+  }
+
+  // Initialize OLED display if available
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    debugLog("OLED initialization failed");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("ESP32 ArtNet Controller");
+    display.setCursor(0, 10);
+    if (WiFi.status() == WL_CONNECTED) {
+      display.print("IP: ");
+      display.println(WiFi.localIP());
+    } else {
+      display.println("WiFi: Not Connected");
+    }
+    display.display();
+  }
+
+  // Initialize UART bridge if needed
+  uartBridge.initializeCommunication();
+  uartBridge.registerCommandCallback(handleUARTCommand);
+
+  // Set up web server
+  server.on("/", handleRoot);
+  server.on("/config", HTTP_POST, handleConfig);
+  server.on("/debug", handleDebugLog);
+  server.begin();
+  debugLog("Web server started on port 80");
+
+  // Initialize ArtNet if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED && fullSettings.useArtnet) {
+    setupArtNet();
+  }
+
+  debugLog("Setup complete");
 }
 
 // Create a minimal loop function
@@ -544,8 +688,116 @@ void loop()
 {
   // Keep the watchdog happy
   yield();
-  delay(10);
-
-  // Rest of loop implementation...
-  // This would include LED updates, web server handling, etc.
+  
+  // Process pending web server requests
+  server.handleClient();
+  
+  // Process UART bridge commands
+  uartBridge.processIncomingData();
+  
+  // Periodically update status information
+  static unsigned long lastStatusUpdate = 0;
+  unsigned long currentMillis = millis();
+  
+  // Status update every 5 seconds
+  if (currentMillis - lastStatusUpdate > 5000) {
+    lastStatusUpdate = currentMillis;
+    
+    // Log system status
+    debugLog("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+    
+    // Update OLED display if available
+    if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      
+      // Display header
+      display.setCursor(0, 0);
+      display.print("ESP32 ArtNet Controller");
+      
+      // Display IP and connection status
+      display.setCursor(0, 10);
+      if (WiFi.status() == WL_CONNECTED) {
+        display.print("IP: ");
+        display.println(WiFi.localIP());
+      } else {
+        display.println("WiFi: Not Connected");
+      }
+      
+      // Display ArtNet status
+      display.setCursor(0, 20);
+      if (state.artnetRunning) {
+        display.print("ArtNet: Universe ");
+        display.print(settings.artnetUniverse);
+      } else {
+        display.print("ArtNet: Disabled");
+      }
+      
+      display.display();
+    }
+  }
+  
+  // Handle LED updates based on current mode
+  if (WiFi.status() == WL_CONNECTED && fullSettings.useArtnet && state.artnetRunning) {
+    // ArtNet mode is active and working - let the callbacks handle updates
+    // Just check for timeout (no packets received for a while)
+    if (state.lastArtnetPacket > 0 && currentMillis - state.lastArtnetPacket > 10000) {
+      // No packets for 10 seconds - show indicator on the strip
+      if (currentMillis % 2000 < 1000) {
+        fill_solid(leds, settings.ledCount, CRGB::Blue);
+      } else {
+        fill_solid(leds, settings.ledCount, CRGB::Black);
+      }
+      FastLED.show();
+    }
+  } else if (!fullSettings.useArtnet) {
+    // Local control modes
+    if (fullSettings.useStaticColor) {
+      // Static color mode
+      CRGB staticColor = CRGB(fullSettings.staticColor.r, fullSettings.staticColor.g, fullSettings.staticColor.b);
+      fill_solid(leds, settings.ledCount, staticColor);
+      FastLED.show();
+      delay(50);  // Small delay to prevent too frequent updates
+    } else if (fullSettings.useColorCycle) {
+      // Color cycle modes
+      static uint8_t hue = 0;
+      uint8_t speed = map(fullSettings.cycleSpeed, 1, 100, 1, 10);
+      
+      switch (fullSettings.colorMode) {
+        case COLOR_MODE_RAINBOW:
+          // Rainbow cycle effect
+          fill_rainbow(leds, settings.ledCount, hue, 255 / settings.ledCount);
+          hue += speed;
+          break;
+          
+        case COLOR_MODE_PULSE:
+          // Pulsing effect
+          {
+            uint8_t brightness = 128 + 127 * sin(currentMillis / 1000.0);
+            CRGB color = CHSV(hue, 255, brightness);
+            fill_solid(leds, settings.ledCount, color);
+            hue += speed / 2;
+          }
+          break;
+          
+        case COLOR_MODE_FIRE:
+          // Fire effect (simplified)
+          for (int i = 0; i < settings.ledCount; i++) {
+            uint8_t flicker = random8(80);
+            leds[i] = CRGB(255 - flicker, 100 - flicker, 0);
+          }
+          break;
+      }
+      
+      FastLED.show();
+      delay(20);  // Small delay to control frame rate
+    } else {
+      // If no mode is active, turn off LEDs
+      if (currentMillis % 10000 == 0) {  // Only update occasionally to save power
+        fill_solid(leds, settings.ledCount, CRGB::Black);
+        FastLED.show();
+      }
+    }
+  }
 }
